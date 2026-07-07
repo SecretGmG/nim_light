@@ -967,7 +967,10 @@ fn render(
             stdout,
             Print("\r\n\r\n"),
             Print(panel.status),
-            Print(format!("    threads: {}", panel.threads)),
+            Print(format!(
+                "    threads: {}  depth: {}  queue×{}",
+                panel.threads, panel.parallel_depth, panel.permit_factor
+            )),
             Print("\r\n")
         )?;
         render_progress(stdout, panel.progress)?;
@@ -989,16 +992,19 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "{}×{}  target: {}  nodes: {}  threads: {}  cache: {}\r\n",
+            "{}×{}  target: {}  nodes: {}  threads: {}  depth: {}  queue×{}  cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
             editor.maze.alive_count(),
             editor.solver_threads,
+            editor.solver_parallel_depth,
+            editor.solver_permit_factor,
             editor.evaluator.cache_len()
         )),
         Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
-        Print("S save cache · L load cache · +/- rows · </> cols · [/] threads\r\n"),
+        Print("S save cache · L load cache · [/] threads · d/D depth · f/F queue multiplier\r\n"),
+        Print("+/- rows · </> cols\r\n"),
         Print("r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 
