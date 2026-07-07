@@ -2,7 +2,10 @@
 
 use std::{
     collections::{HashMap, hash_map::Entry},
+    fs::File,
     hash::{DefaultHasher, Hash, Hasher},
+    io::{self, Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -24,7 +27,8 @@ use crate::{
 };
 
 const DEFAULT_GROUPED_PERMIT_DEPTH: usize = 2;
-const DEFAULT_GROUPED_PERMIT_FACTOR: usize = 8;
+const DEFAULT_GROUPED_PERMIT_FACTOR: usize = 16;
+const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH01";
 
 /// A conservative zero certificate evaluated after a cache miss.
 pub trait SymmetryFinder: Send + Sync {
@@ -134,6 +138,11 @@ impl AtomicEvaluatorStats {
 
 struct ShardedCache {
     shards: Vec<Mutex<HashMap<CanonicalGame, CacheEntry>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheIoReport {
+    pub entries: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -255,6 +264,76 @@ impl ShardedCache {
         profile
     }
 
+    fn done_len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("cache shard poisoned")
+                    .values()
+                    .filter(|entry| matches!(entry, CacheEntry::Done(_)))
+                    .count()
+            })
+            .sum()
+    }
+
+    fn clone_done_into_shards(&self, shard_count: usize) -> Self {
+        let copied = Self::new(shard_count);
+        for shard in &self.shards {
+            let guard = shard.lock().expect("cache shard poisoned");
+            for (game, entry) in guard.iter() {
+                if let CacheEntry::Done(nimber) = entry {
+                    copied.insert_done(game.clone(), *nimber);
+                }
+            }
+        }
+        copied
+    }
+
+    fn insert_done(&self, game: CanonicalGame, nimber: usize) {
+        self.shards[self.shard(&game)]
+            .lock()
+            .expect("cache shard poisoned")
+            .insert(game, CacheEntry::Done(nimber));
+    }
+
+    fn save_to(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
+        let mut file = File::create(path)?;
+        let entries = self.done_len();
+        file.write_all(CACHE_FILE_MAGIC)?;
+        write_u64(&mut file, entries)?;
+        for shard in &self.shards {
+            let guard = shard.lock().expect("cache shard poisoned");
+            for (game, entry) in guard.iter() {
+                if let CacheEntry::Done(nimber) = entry {
+                    write_cache_entry(&mut file, game, *nimber)?;
+                }
+            }
+        }
+        Ok(CacheIoReport { entries })
+    }
+
+    fn load_from(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
+        let mut file = File::open(path)?;
+        let mut magic = [0; CACHE_FILE_MAGIC.len()];
+        file.read_exact(&mut magic)?;
+        if &magic != CACHE_FILE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a nim_light cache file",
+            ));
+        }
+
+        let entries = read_usize(&mut file, "cache entry count")?;
+        self.clear();
+        for _ in 0..entries {
+            let (game, nimber) = read_cache_entry(&mut file)?;
+            self.insert_done(game, nimber);
+        }
+        Ok(CacheIoReport { entries })
+    }
+
     fn clear(&self) {
         for shard in &self.shards {
             shard.lock().expect("cache shard poisoned").clear();
@@ -275,6 +354,80 @@ impl ShardedCache {
         game.hash(&mut hasher);
         hasher.finish() as usize % self.shards.len()
     }
+}
+
+fn write_cache_entry(
+    writer: &mut impl Write,
+    game: &CanonicalGame,
+    nimber: usize,
+) -> io::Result<()> {
+    write_u64(writer, nimber)?;
+    write_u64(writer, game.components().len())?;
+    for component in game.components() {
+        write_matrix(writer, component)?;
+    }
+    Ok(())
+}
+
+fn read_cache_entry(reader: &mut impl Read) -> io::Result<(CanonicalGame, usize)> {
+    let nimber = read_usize(reader, "nimber")?;
+    let component_count = read_usize(reader, "component count")?;
+    let mut components = Vec::with_capacity(component_count);
+    for _ in 0..component_count {
+        components.push(read_matrix(reader)?);
+    }
+    Ok((CanonicalGame::from_canonical_components(components), nimber))
+}
+
+fn write_matrix(writer: &mut impl Write, matrix: &BitMatrix) -> io::Result<()> {
+    write_u64(writer, matrix.rows())?;
+    write_u64(writer, matrix.cols())?;
+    write_u64(writer, matrix.words().len())?;
+    for &word in matrix.words() {
+        writer.write_all(&word.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_matrix(reader: &mut impl Read) -> io::Result<BitMatrix> {
+    let rows = read_usize(reader, "matrix rows")?;
+    let cols = read_usize(reader, "matrix columns")?;
+    let word_count = read_usize(reader, "matrix word count")?;
+    let expected_words = rows
+        .checked_mul(cols.div_ceil(64))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "matrix dimensions overflow"))?;
+    if word_count != expected_words {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "matrix word count does not match dimensions",
+        ));
+    }
+
+    let mut words = Vec::with_capacity(word_count);
+    for _ in 0..word_count {
+        words.push(read_u64(reader)?);
+    }
+    Ok(BitMatrix::from_words(rows, cols, words))
+}
+
+fn write_u64(writer: &mut impl Write, value: usize) -> io::Result<()> {
+    writer.write_all(&(value as u64).to_le_bytes())
+}
+
+fn read_usize(reader: &mut impl Read, name: &'static str) -> io::Result<usize> {
+    let value = read_u64(reader)?;
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} does not fit in usize"),
+        )
+    })
+}
+
+fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
+    let mut bytes = [0; std::mem::size_of::<u64>()];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn evict_done_entries(
@@ -332,7 +485,7 @@ fn fnv_mix(mut hash: u64, value: u64) -> u64 {
 pub struct Evaluator<G, S = NoSymmetryFinder> {
     generator: G,
     symmetry_finder: S,
-    cache: ShardedCache,
+    cache: Arc<ShardedCache>,
     pool: ThreadPool,
     config: EvaluatorConfig,
     stats: AtomicEvaluatorStats,
@@ -364,7 +517,31 @@ where
         Ok(Self {
             generator,
             symmetry_finder,
-            cache: ShardedCache::new(config.cache_shards),
+            cache: Arc::new(ShardedCache::new(config.cache_shards)),
+            pool: builder.build()?,
+            config,
+            stats: AtomicEvaluatorStats::default(),
+            created_at: Instant::now(),
+        })
+    }
+
+    fn with_config_and_cache(
+        generator: G,
+        symmetry_finder: S,
+        config: EvaluatorConfig,
+        cache: ShardedCache,
+    ) -> Result<Self, ThreadPoolBuildError> {
+        assert!(config.cache_shards > 0, "cache_shards must be positive");
+        let mut builder = ThreadPoolBuilder::new();
+        if let Some(threads) = config.threads {
+            assert!(threads > 0, "threads must be positive");
+            builder = builder.num_threads(threads);
+        }
+
+        Ok(Self {
+            generator,
+            symmetry_finder,
+            cache: Arc::new(cache),
             pool: builder.build()?,
             config,
             stats: AtomicEvaluatorStats::default(),
@@ -456,6 +633,14 @@ where
         self.cache.clear();
     }
 
+    pub fn save_cache(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
+        self.cache.save_to(path)
+    }
+
+    pub fn load_cache(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
+        self.cache.load_from(path)
+    }
+
     pub fn stats(&self) -> EvaluatorStats {
         self.stats.snapshot()
     }
@@ -499,6 +684,27 @@ where
 
     pub fn generator(&self) -> &G {
         &self.generator
+    }
+
+    pub fn with_threads_preserving_cache(
+        &self,
+        threads: usize,
+        cache_shards: usize,
+    ) -> Result<Self, ThreadPoolBuildError>
+    where
+        G: Clone,
+        S: Clone,
+    {
+        let mut config = self.config;
+        config.threads = Some(threads);
+        config.cache_shards = cache_shards;
+        let cache = self.cache.clone_done_into_shards(cache_shards);
+        Self::with_config_and_cache(
+            self.generator.clone(),
+            self.symmetry_finder.clone(),
+            config,
+            cache,
+        )
     }
 
     fn parallel_permits(&self, permit_factor: usize) -> ParallelPermits {
@@ -1139,6 +1345,7 @@ impl Default for DfsSolver {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize},
@@ -1371,6 +1578,50 @@ mod tests {
         assert_eq!(solver.nimber(&heap), first);
         assert_eq!(solver.cache_len(), cache_size);
         assert!(solver.stats().completed_cache_hits > hits);
+    }
+
+    #[test]
+    fn cache_can_be_saved_loaded_and_reused() {
+        let path = std::env::temp_dir().join(format!(
+            "nim_light_cache_test_{}_{}.bin",
+            std::process::id(),
+            stable_game_hash(&CanonicalGame::from_matrix(&heap(1)))
+        ));
+        let _ = fs::remove_file(&path);
+
+        let first = DfsSolver::default();
+        assert_eq!(first.nimber(&heap(4)), 4);
+        let saved = first.save_cache(&path).unwrap();
+        assert!(saved.entries > 0);
+
+        let second = DfsSolver::default();
+        let loaded = second.load_cache(&path).unwrap();
+        assert_eq!(loaded.entries, saved.entries);
+        assert_eq!(
+            second.cached_nimber_of_canonical(&CanonicalGame::from_matrix(&heap(4))),
+            Some(4)
+        );
+        assert_eq!(second.nimber(&heap(4)), 4);
+        assert!(second.stats().completed_cache_hits > 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn changing_threads_preserves_completed_cache_entries() {
+        let solver = DfsSolver::default();
+        assert_eq!(solver.nimber(&heap(5)), 5);
+        let cache_len = solver.cache_len();
+        assert!(cache_len > 0);
+
+        let reconfigured = solver.with_threads_preserving_cache(2, 64).unwrap();
+        assert_eq!(reconfigured.cache_len(), cache_len);
+        assert_eq!(
+            reconfigured.cached_nimber_of_canonical(&CanonicalGame::from_matrix(&heap(5))),
+            Some(5)
+        );
+        assert_eq!(reconfigured.nimber(&heap(5)), 5);
+        assert!(reconfigured.stats().completed_cache_hits > 0);
     }
 
     #[test]

@@ -300,6 +300,7 @@ struct Editor {
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
+    cache_status: Option<String>,
 }
 
 impl Editor {
@@ -314,6 +315,7 @@ impl Editor {
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
+            cache_status: None,
         }
     }
 
@@ -350,6 +352,7 @@ impl Editor {
         self.last_evaluation = None;
         self.nimber_is_current = false;
         self.last_cancelled = false;
+        self.cache_status = Some("cache cleared".to_owned());
     }
 
     fn adjust_solver_threads(&mut self, delta: isize) {
@@ -360,9 +363,52 @@ impl Editor {
         if threads == self.solver_threads {
             return;
         }
-        self.solver_threads = threads;
-        self.evaluator = new_evaluator(threads);
-        self.last_cancelled = false;
+        let cache_shards = cache_shards_for_threads(threads);
+        match self
+            .evaluator
+            .with_threads_preserving_cache(threads, cache_shards)
+        {
+            Ok(evaluator) => {
+                self.solver_threads = threads;
+                self.evaluator = Arc::new(evaluator);
+                self.last_cancelled = false;
+                self.cache_status = Some(format!(
+                    "threads set to {threads}; completed cache entries preserved"
+                ));
+            }
+            Err(error) => {
+                self.cache_status = Some(format!("failed to change threads: {error}"));
+            }
+        }
+    }
+
+    fn save_cache(&mut self) {
+        match self.evaluator.save_cache(CACHE_FILE) {
+            Ok(report) => {
+                self.cache_status = Some(format!(
+                    "saved {} completed entries to {CACHE_FILE}",
+                    report.entries
+                ));
+            }
+            Err(error) => {
+                self.cache_status = Some(format!("failed to save cache: {error}"));
+            }
+        }
+    }
+
+    fn load_cache(&mut self) {
+        match self.evaluator.load_cache(CACHE_FILE) {
+            Ok(report) => {
+                self.cache_status = Some(format!(
+                    "loaded {} completed entries from {CACHE_FILE}",
+                    report.entries
+                ));
+                self.last_cancelled = false;
+            }
+            Err(error) => {
+                self.cache_status = Some(format!("failed to load cache: {error}"));
+            }
+        }
     }
 
     fn reset_demo(&mut self) {
@@ -412,6 +458,7 @@ impl Editor {
 
 const DEFAULT_SOLVER_THREADS: usize = 6;
 const MAX_SOLVER_THREADS: usize = 256;
+const CACHE_FILE: &str = "nim_light.cache";
 
 fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
     let cache_shards = cache_shards_for_threads(threads);
@@ -458,6 +505,8 @@ fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGa
                 KeyCode::Char(' ') => editor.toggle_current(),
                 KeyCode::Char('n') => evaluate_editor(stdout, editor)?,
                 KeyCode::Char('c') => editor.clear_cache(),
+                KeyCode::Char('S') => editor.save_cache(),
+                KeyCode::Char('L') => editor.load_cache(),
                 KeyCode::Char('[') => editor.adjust_solver_threads(-1),
                 KeyCode::Char(']') => editor.adjust_solver_threads(1),
                 KeyCode::Char('r') => editor.reset_demo(),
@@ -883,8 +932,9 @@ fn render_editor(
             editor.solver_threads,
             editor.evaluator.cache_len()
         )),
-        Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c cache\r\n"),
-        Print("+/- rows · </> cols · [/] threads · r demo · o open · m/Esc menu · q quit\r\n\r\n")
+        Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
+        Print("S save cache · L load cache · +/- rows · </> cols · [/] threads\r\n"),
+        Print("r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 
     render_editor_maze(stdout, editor)?;
@@ -947,6 +997,14 @@ fn render_editor(
         )?;
     }
     render_progress(stdout, progress)?;
+    if let Some(status) = &editor.cache_status {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{status}\r\n")),
+            ResetColor
+        )?;
+    }
 
     stdout.flush()
 }

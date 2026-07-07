@@ -147,7 +147,7 @@ fn permit_parallel_ab(c: &mut Criterion) {
             |bencher| {
                 bencher.iter(|| {
                     let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_with_parallel_params(&game, 0, 8));
+                    black_box(evaluator.nimber_with_parallel_params(&game, 0, 16));
                 });
             },
         );
@@ -167,7 +167,7 @@ fn permit_parallel_ab(c: &mut Criterion) {
             |bencher| {
                 bencher.iter(|| {
                     let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_with_parallel_params(&game, 3, 8));
+                    black_box(evaluator.nimber_with_parallel_params(&game, 3, 16));
                 });
             },
         );

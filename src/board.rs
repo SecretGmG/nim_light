@@ -96,6 +96,30 @@ impl BitMatrix {
         &self.data[start..start + self.words_per_row]
     }
 
+    pub(crate) fn words(&self) -> &[u64] {
+        &self.data
+    }
+
+    pub(crate) fn from_words(rows: usize, cols: usize, mut data: Vec<u64>) -> Self {
+        let words_per_row = cols.div_ceil(64);
+        assert_eq!(data.len(), rows * words_per_row);
+
+        if !cols.is_multiple_of(64) && words_per_row > 0 {
+            let used_bits = cols % 64;
+            let mask = (1u64 << used_bits) - 1;
+            for row in 0..rows {
+                data[row * words_per_row + words_per_row - 1] &= mask;
+            }
+        }
+
+        Self {
+            rows,
+            cols,
+            words_per_row,
+            data,
+        }
+    }
+
     pub fn row_ones(&self, row: usize) -> impl Iterator<Item = usize> + '_ {
         assert!(row < self.rows);
         self.row_words(row)

@@ -109,6 +109,10 @@ impl CanonicalGame {
         }
     }
 
+    pub(crate) fn from_canonical_components(components: Vec<BitMatrix>) -> Self {
+        Self { components }
+    }
+
     fn from_components(mut components: Vec<BitMatrix>) -> Self {
         components.sort();
 
