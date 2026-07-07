@@ -75,9 +75,15 @@ The current solver intentionally keeps the core simple:
 4. Evaluate with a parallel depth-first search and a shared cache.
 5. Use conservative symmetry certificates only when they prove nimber zero.
 
-The default parallel scheduler uses grouped permit parallelism with depth 2 and
-a permit factor of 16. The plain DFS path remains as an internal fallback and
-benchmark comparison.
+The default parallel scheduler uses a cooperative root evaluation: all worker
+threads pull root successor groups, evaluate their branches depth-first, and
+use shared `Processing` cache entries to avoid piling onto already-owned work.
+Within grouped evaluation, a busy successor defers the rest of that group on
+the first pass; deferred groups are revisited after fresh groups are exhausted.
+
+The parameterized scheduler still supports grouped permit parallelism with
+depth 2 and queue multiplier 16 as the default settings. The plain DFS path
+remains as an internal fallback and benchmark comparison.
 
 ## Reference result
 

@@ -559,6 +559,9 @@ where
         max_depth: usize,
         permit_factor: usize,
     ) -> usize {
+        if max_depth == DEFAULT_PARALLEL_DEPTH && permit_factor == DEFAULT_PERMIT_FACTOR {
+            return self.nimber(matrix);
+        }
         let game = self.generator.canonicalize(matrix.clone());
         self.nimber_of_canonical_with_parallel_params(&game, max_depth, permit_factor)
     }
@@ -577,11 +580,9 @@ where
     }
 
     pub fn nimber_of_canonical(&self, game: &CanonicalGame) -> usize {
-        self.nimber_of_canonical_with_parallel_params(
-            game,
-            DEFAULT_PARALLEL_DEPTH,
-            DEFAULT_PERMIT_FACTOR,
-        )
+        self.pool
+            .install(|| self.nimber_cooperative_root_inner(game, None))
+            .expect("uncancellable evaluation must not be cancelled")
     }
 
     pub fn nimber_of_canonical_with_parallel_params(
@@ -601,12 +602,13 @@ where
         game: &CanonicalGame,
         cancel: &Arc<AtomicBool>,
     ) -> Option<usize> {
-        self.nimber_of_canonical_cancellable_with_parallel_params(
-            game,
-            DEFAULT_PARALLEL_DEPTH,
-            DEFAULT_PERMIT_FACTOR,
-            cancel,
-        )
+        let nimber = self
+            .pool
+            .install(|| self.nimber_cooperative_root_inner(game, Some(cancel.as_ref())));
+        if nimber.is_none() {
+            self.cache.clear_processing();
+        }
+        nimber
     }
 
     pub fn nimber_cancellable_with_parallel_params(
@@ -616,6 +618,9 @@ where
         permit_factor: usize,
         cancel: &Arc<AtomicBool>,
     ) -> Option<usize> {
+        if max_depth == DEFAULT_PARALLEL_DEPTH && permit_factor == DEFAULT_PERMIT_FACTOR {
+            return self.nimber_cancellable(matrix, cancel);
+        }
         let game = self.generator.canonicalize(matrix.clone());
         let nimber = self.nimber_of_canonical_cancellable_with_parallel_params(
             &game,
@@ -793,6 +798,50 @@ where
         }
     }
 
+    fn nimber_cooperative_root_inner(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if game.is_empty() {
+            return Some(0);
+        }
+
+        Some(match self.cache.probe(game) {
+            CacheProbe::Done(nimber) => {
+                self.stats
+                    .completed_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                nimber
+            }
+            CacheProbe::Busy => {
+                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                if let Some(nimber) = self.cache.get_done(game) {
+                    self.stats
+                        .completed_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    nimber
+                } else {
+                    self.evaluate_duplicate(game, self.config.parallel_depth, cancel)?
+                }
+            }
+            CacheProbe::Claimed => {
+                self.stats
+                    .unique_positions_claimed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .evaluation_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let nimber = self.compute_position_cooperative_root(game, cancel)?;
+                self.cache_result(game.clone(), nimber);
+                nimber
+            }
+        })
+    }
+
     fn try_nimber(
         &self,
         game: &CanonicalGame,
@@ -913,6 +962,20 @@ where
                 cancel,
             )
         }
+    }
+
+    fn compute_position_cooperative_root(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if game.components().len() > 1 {
+            return self.nimber_of_components(game, self.config.parallel_depth, cancel);
+        }
+        self.nimber_of_component_cooperative_root(&game.components()[0], cancel)
     }
 
     fn evaluate_duplicate(
@@ -1036,6 +1099,87 @@ where
         Some(reachable.mex())
     }
 
+    fn nimber_of_component_cooperative_root(
+        &self,
+        component: &BitMatrix,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if self.symmetry_finder.proves_zero(component) {
+            self.stats
+                .symmetry_zero_certificates
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(0);
+        }
+
+        let bound = component.count_ones() + 1;
+        let groups = Mutex::new(
+            self.generator
+                .successor_groups(component)
+                .collect::<Vec<_>>(),
+        );
+        let result = Mutex::new(WorkerResult::new(bound));
+        let worker_count = self.pool.current_num_threads().max(1);
+
+        self.stats
+            .parallel_expansions
+            .fetch_add(1, Ordering::Relaxed);
+
+        rayon::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|_| {
+                    let mut local = WorkerResult::new(bound);
+                    loop {
+                        if is_cancelled(cancel) {
+                            local.cancelled = true;
+                            break;
+                        }
+                        let Some(group) = groups.lock().expect("root groups poisoned").pop() else {
+                            break;
+                        };
+                        let mut deferred = Vec::new();
+                        self.evaluate_successor_group_vec_with_deferral(
+                            group.into_iter().collect(),
+                            &mut local,
+                            &mut deferred,
+                            DeferMode::Fresh,
+                            cancel,
+                        );
+                        for deferred_group in deferred {
+                            self.evaluate_successor_group_vec_with_deferral(
+                                deferred_group,
+                                &mut local,
+                                &mut Vec::new(),
+                                DeferMode::Revisit,
+                                cancel,
+                            );
+                            if local.cancelled {
+                                break;
+                            }
+                        }
+                        if local.cancelled {
+                            break;
+                        }
+                    }
+
+                    let mut result = result.lock().expect("root result poisoned");
+                    result.cancelled |= local.cancelled;
+                    result.reachable.union_with(&local.reachable);
+                    result.pending.extend(local.pending);
+                });
+            }
+        });
+
+        let mut result = result.into_inner().expect("root result poisoned");
+        self.resolve_pending(&mut result, self.config.parallel_depth, cancel);
+        if result.cancelled {
+            return None;
+        }
+        Some(result.reachable.mex())
+    }
+
     fn nimber_of_components_grouped_permit(
         &self,
         game: &CanonicalGame,
@@ -1132,20 +1276,28 @@ where
                     .fold(
                         || WorkerResult::new(bound),
                         |mut worker, group| {
-                            for successor in group {
-                                if is_cancelled(cancel) {
-                                    worker.cancelled = true;
+                            let mut deferred = Vec::new();
+                            self.evaluate_successor_group_with_permit_deferral(
+                                group,
+                                &mut worker,
+                                &mut deferred,
+                                depth_remaining - 1,
+                                permits,
+                                cancel,
+                            );
+                            for deferred_group in deferred {
+                                self.evaluate_successor_group_vec_with_permit_deferral(
+                                    deferred_group,
+                                    &mut worker,
+                                    &mut Vec::new(),
+                                    depth_remaining - 1,
+                                    permits,
+                                    DeferMode::Revisit,
+                                    cancel,
+                                );
+                                if worker.cancelled {
                                     break;
                                 }
-                                worker.push(
-                                    self.try_nimber_grouped_permit(
-                                        &successor,
-                                        depth_remaining - 1,
-                                        permits,
-                                        cancel,
-                                    ),
-                                    successor,
-                                );
                             }
                             worker
                         },
@@ -1190,19 +1342,119 @@ where
         I: IntoIterator<Item = H>,
         H: IntoIterator<Item = CanonicalGame>,
     {
+        let mut deferred = Vec::new();
         for group in groups {
-            for successor in group {
-                if is_cancelled(cancel) {
-                    worker.cancelled = true;
-                    return;
-                }
-                worker.push(
-                    self.try_nimber(&successor, self.config.parallel_depth, cancel),
-                    successor,
-                );
+            self.evaluate_successor_group_vec_with_deferral(
+                group.into_iter().collect(),
+                worker,
+                &mut deferred,
+                DeferMode::Fresh,
+                cancel,
+            );
+            if worker.cancelled {
+                return;
+            }
+        }
+        for group in deferred {
+            self.evaluate_successor_group_vec_with_deferral(
+                group,
+                worker,
+                &mut Vec::new(),
+                DeferMode::Revisit,
+                cancel,
+            );
+            if worker.cancelled {
+                return;
             }
         }
         self.resolve_pending(worker, self.config.parallel_depth, cancel);
+    }
+
+    fn evaluate_successor_group_vec_with_deferral(
+        &self,
+        successors: Vec<CanonicalGame>,
+        worker: &mut WorkerResult,
+        deferred: &mut Vec<Vec<CanonicalGame>>,
+        mode: DeferMode,
+        cancel: Option<&AtomicBool>,
+    ) {
+        for (index, successor) in successors.iter().enumerate() {
+            if is_cancelled(cancel) {
+                worker.cancelled = true;
+                return;
+            }
+            match self.try_nimber(successor, self.config.parallel_depth, cancel) {
+                Some(Evaluation::Ready(nimber)) => worker.reachable.insert(nimber),
+                Some(Evaluation::Busy) => {
+                    if mode == DeferMode::Fresh {
+                        deferred.push(successors[index..].to_vec());
+                        return;
+                    } else {
+                        worker.pending.push(successor.clone());
+                    }
+                }
+                None => {
+                    worker.cancelled = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn evaluate_successor_group_with_permit_deferral<H>(
+        &self,
+        group: H,
+        worker: &mut WorkerResult,
+        deferred: &mut Vec<Vec<CanonicalGame>>,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) where
+        H: IntoIterator<Item = CanonicalGame>,
+    {
+        self.evaluate_successor_group_vec_with_permit_deferral(
+            group.into_iter().collect(),
+            worker,
+            deferred,
+            depth_remaining,
+            permits,
+            DeferMode::Fresh,
+            cancel,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_successor_group_vec_with_permit_deferral(
+        &self,
+        successors: Vec<CanonicalGame>,
+        worker: &mut WorkerResult,
+        deferred: &mut Vec<Vec<CanonicalGame>>,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        mode: DeferMode,
+        cancel: Option<&AtomicBool>,
+    ) {
+        for (index, successor) in successors.iter().enumerate() {
+            if is_cancelled(cancel) {
+                worker.cancelled = true;
+                return;
+            }
+            match self.try_nimber_grouped_permit(successor, depth_remaining, permits, cancel) {
+                Some(Evaluation::Ready(nimber)) => worker.reachable.insert(nimber),
+                Some(Evaluation::Busy) => {
+                    if mode == DeferMode::Fresh {
+                        deferred.push(successors[index..].to_vec());
+                        return;
+                    } else {
+                        worker.pending.push(successor.clone());
+                    }
+                }
+                None => {
+                    worker.cancelled = true;
+                    return;
+                }
+            }
+        }
     }
 
     fn resolve_pending(
@@ -1255,6 +1507,12 @@ where
 enum Evaluation {
     Ready(usize),
     Busy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferMode {
+    Fresh,
+    Revisit,
 }
 
 struct WorkerResult {
