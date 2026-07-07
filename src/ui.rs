@@ -492,7 +492,13 @@ fn play_game(
         }
 
         if game.current_player().kind == PlayerKind::SolverCpu {
-            match run_cpu_turn(stdout, game, &selection, Arc::clone(&solver), solver_threads)? {
+            match run_cpu_turn(
+                stdout,
+                game,
+                &selection,
+                Arc::clone(&solver),
+                solver_threads,
+            )? {
                 CpuTurn::Played => {}
                 CpuTurn::Cancelled => return Ok(PostGame::Menu),
                 CpuTurn::Quit => return Ok(PostGame::Quit),
@@ -686,6 +692,7 @@ fn render(
             stdout,
             Print("\r\n\r\n"),
             Print(panel.status),
+            Print(format!("    threads: {}", panel.threads)),
             Print("\r\n")
         )?;
         render_progress(stdout, panel.progress)?;
@@ -707,15 +714,16 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "Size: {}×{}    Target: {}    remaining nodes: {}    cache: {}\r\n",
+            "Size: {}×{}    Target: {}    remaining nodes: {}    threads: {}    cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
             editor.maze.alive_count(),
+            editor.solver_threads,
             editor.evaluator.cache_len()
         )),
         Print("Arrows/hjkl: move   Tab: target   Space: toggle   n: nimber\r\n"),
-        Print("+/-: rows   </>: cols   c: clear cache\r\n"),
+        Print("+/-: rows   </>: cols   [/]: threads   c: clear cache\r\n"),
         Print("r: demo board   o: open board   m/Esc: menu   q: quit\r\n\r\n")
     )?;
 
