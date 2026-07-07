@@ -149,6 +149,7 @@ struct LastSpace {
 
 const DOUBLE_SPACE_WINDOW: Duration = Duration::from_millis(350);
 const SWEEP_FRAME: Duration = Duration::from_millis(28);
+const SOLVER_REFRESH: Duration = Duration::from_millis(350);
 
 pub fn run() -> io::Result<()> {
     let _terminal = TerminalGuard::enter()?;
@@ -361,20 +362,26 @@ impl Editor {
 }
 
 const DEFAULT_SOLVER_THREADS: usize = 6;
-const MAX_SOLVER_THREADS: usize = 64;
+const MAX_SOLVER_THREADS: usize = 256;
 
 fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
+    let cache_shards = cache_shards_for_threads(threads);
     Arc::new(
         Evaluator::with_config(
             CanonicalMoveGenerator::new(PseudoCanonicalizer),
             InvolutionSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(threads),
+                cache_shards,
                 ..EvaluatorConfig::default()
             },
         )
         .expect("failed to create evaluator worker pool"),
     )
+}
+
+fn cache_shards_for_threads(threads: usize) -> usize {
+    threads.saturating_mul(8).next_power_of_two().max(64)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -444,9 +451,9 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
                 render_editor(
                     stdout,
                     editor,
-                    Some((evaluator.progress(), started.elapsed())),
+                    Some((evaluator.cheap_progress(), started.elapsed())),
                 )?;
-                if event::poll(Duration::from_millis(100))?
+                if event::poll(SOLVER_REFRESH)?
                     && let Event::Key(key) = event::read()?
                     && is_press(key)
                     && matches!(key.code, KeyCode::Esc | KeyCode::Char('x'))
@@ -661,7 +668,7 @@ fn run_cpu_turn(
                     selection,
                     Some(SolverPanel {
                         status,
-                        progress: solver.progress(),
+                        progress: solver.cheap_progress(),
                         threads: solver_threads,
                     }),
                 )?;
@@ -671,7 +678,7 @@ fn run_cpu_turn(
                 )?;
                 stdout.flush()?;
 
-                if event::poll(Duration::from_millis(100))?
+                if event::poll(SOLVER_REFRESH)?
                     && let Event::Key(key) = event::read()?
                     && is_press(key)
                 {
@@ -895,6 +902,11 @@ fn render_editor(
 
 fn render_progress(stdout: &mut impl Write, progress: EvaluatorProgress) -> io::Result<()> {
     let stats = progress.stats;
+    let estimated_bytes = if progress.estimated_cache_bytes == 0 && progress.cache_entries > 0 {
+        "n/a".to_owned()
+    } else {
+        format_bytes(progress.estimated_cache_bytes)
+    };
     queue!(
         stdout,
         Print(format!(
@@ -905,7 +917,7 @@ fn render_progress(stdout: &mut impl Write, progress: EvaluatorProgress) -> io::
             stats.completed_cache_hits,
             progress.cache_done_entries,
             progress.cache_processing_entries,
-            format_bytes(progress.estimated_cache_bytes)
+            estimated_bytes
         )),
         Print(format!(
             "busy {}  deferred {}  forced {}  symmetry {}  parallel {}\r\n",
@@ -1118,4 +1130,19 @@ fn render_horizontal_boundary(
         queue!(stdout, Print(if wall { "───" } else { "   " }), Print("+"))?;
     }
     queue!(stdout, Print("\r\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_shards_for_threads;
+
+    #[test]
+    fn cache_shards_scale_with_solver_threads() {
+        assert_eq!(cache_shards_for_threads(1), 64);
+        assert_eq!(cache_shards_for_threads(6), 64);
+        assert_eq!(cache_shards_for_threads(16), 128);
+        assert_eq!(cache_shards_for_threads(64), 512);
+        assert_eq!(cache_shards_for_threads(100), 1024);
+        assert_eq!(cache_shards_for_threads(128), 1024);
+    }
 }

@@ -229,7 +229,10 @@ impl ShardedCache {
     }
 
     fn len(&self) -> usize {
-        self.profile().entries
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("cache shard poisoned").len())
+            .sum()
     }
 
     fn profile(&self) -> CacheProfile {
@@ -435,6 +438,25 @@ where
             cache_done_entries: cache.done,
             cache_processing_entries: cache.processing,
             estimated_cache_bytes: cache.estimated_bytes,
+            stats,
+            evaluations_per_second: stats.evaluation_attempts as f64 / seconds,
+            cache_hits_per_second: stats.completed_cache_hits as f64 / seconds,
+            unique_positions_per_second: stats.unique_positions_claimed as f64 / seconds,
+        }
+    }
+
+    pub fn cheap_progress(&self) -> EvaluatorProgress {
+        let elapsed = self.created_at.elapsed();
+        let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+        let stats = self.stats();
+        EvaluatorProgress {
+            elapsed,
+            cache_entries: self.cache.len(),
+            cache_done_entries: stats.completed_positions,
+            cache_processing_entries: stats
+                .unique_positions_claimed
+                .saturating_sub(stats.completed_positions),
+            estimated_cache_bytes: 0,
             stats,
             evaluations_per_second: stats.evaluation_attempts as f64 / seconds,
             cache_hits_per_second: stats.completed_cache_hits as f64 / seconds,
