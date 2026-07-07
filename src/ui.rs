@@ -640,6 +640,7 @@ fn play_game(
     game: &mut Game,
     solver: Arc<DfsSolver>,
     solver_threads: usize,
+    solver_config: SolverSearchConfig,
 ) -> io::Result<PostGame> {
     let mut selection = Selection::new();
     let mut last_space = None;
@@ -654,6 +655,8 @@ fn play_game(
             status: "Solver cache",
             progress: ProgressView::fresh(solver.progress()),
             threads: solver_threads,
+            parallel_depth: solver_config.parallel_depth,
+            permit_factor: solver_config.permit_factor,
         });
         render(stdout, game, &selection, panel)?;
 
@@ -687,6 +690,7 @@ fn play_game(
                 &selection,
                 Arc::clone(&solver),
                 solver_threads,
+                solver_config,
             )? {
                 CpuTurn::Played => {}
                 CpuTurn::Cancelled => return Ok(PostGame::Menu),
@@ -729,6 +733,8 @@ fn play_game(
                             status: "Solver cache",
                             progress: ProgressView::fresh(solver.progress()),
                             threads: solver_threads,
+                            parallel_depth: solver_config.parallel_depth,
+                            permit_factor: solver_config.permit_factor,
                         });
                         let select = last_space
                             .as_ref()
@@ -770,6 +776,8 @@ struct SolverPanel {
     status: &'static str,
     progress: ProgressView,
     threads: usize,
+    parallel_depth: usize,
+    permit_factor: usize,
 }
 
 enum CpuTurn {
@@ -784,6 +792,7 @@ fn run_cpu_turn(
     selection: &Selection,
     solver: Arc<DfsSolver>,
     solver_threads: usize,
+    solver_config: SolverSearchConfig,
 ) -> io::Result<CpuTurn> {
     let maze = game.maze.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -794,7 +803,8 @@ fn run_cpu_turn(
     let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
-        let result = solver_move_cancellable(&maze, &worker_solver, &worker_cancel);
+        let result =
+            solver_move_cancellable_with_config(&maze, &worker_solver, solver_config, &worker_cancel);
         let _ = sender.send(result);
     });
 
@@ -819,6 +829,8 @@ fn run_cpu_turn(
                         status,
                         progress: progress.sample(&solver),
                         threads: solver_threads,
+                        parallel_depth: solver_config.parallel_depth,
+                        permit_factor: solver_config.permit_factor,
                     }),
                 )?;
                 queue!(
