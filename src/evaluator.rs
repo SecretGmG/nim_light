@@ -26,8 +26,8 @@ use crate::{
     symmetry::InvolutionSymmetryFinder,
 };
 
-const DEFAULT_GROUPED_PERMIT_DEPTH: usize = 2;
-const DEFAULT_GROUPED_PERMIT_FACTOR: usize = 16;
+pub const DEFAULT_PARALLEL_DEPTH: usize = 2;
+pub const DEFAULT_PERMIT_FACTOR: usize = 16;
 const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH01";
 
 /// A conservative zero certificate evaluated after a cache miss.
@@ -579,8 +579,8 @@ where
     pub fn nimber_of_canonical(&self, game: &CanonicalGame) -> usize {
         self.nimber_of_canonical_with_parallel_params(
             game,
-            DEFAULT_GROUPED_PERMIT_DEPTH,
-            DEFAULT_GROUPED_PERMIT_FACTOR,
+            DEFAULT_PARALLEL_DEPTH,
+            DEFAULT_PERMIT_FACTOR,
         )
     }
 
@@ -601,11 +601,46 @@ where
         game: &CanonicalGame,
         cancel: &Arc<AtomicBool>,
     ) -> Option<usize> {
-        let permits = self.parallel_permits(DEFAULT_GROUPED_PERMIT_FACTOR);
+        self.nimber_of_canonical_cancellable_with_parallel_params(
+            game,
+            DEFAULT_PARALLEL_DEPTH,
+            DEFAULT_PERMIT_FACTOR,
+            cancel,
+        )
+    }
+
+    pub fn nimber_cancellable_with_parallel_params(
+        &self,
+        matrix: &BitMatrix,
+        max_depth: usize,
+        permit_factor: usize,
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<usize> {
+        let game = self.generator.canonicalize(matrix.clone());
+        let nimber = self.nimber_of_canonical_cancellable_with_parallel_params(
+            &game,
+            max_depth,
+            permit_factor,
+            cancel,
+        );
+        if nimber.is_none() {
+            self.cache.clear_processing();
+        }
+        nimber
+    }
+
+    pub fn nimber_of_canonical_cancellable_with_parallel_params(
+        &self,
+        game: &CanonicalGame,
+        max_depth: usize,
+        permit_factor: usize,
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<usize> {
+        let permits = self.parallel_permits(permit_factor);
         let nimber = self.pool.install(|| {
             self.nimber_grouped_permit_inner(
                 game,
-                DEFAULT_GROUPED_PERMIT_DEPTH,
+                max_depth,
                 &permits,
                 Some(cancel.as_ref()),
             )
@@ -1725,7 +1760,7 @@ mod tests {
         ] {
             let fallback = DfsSolver::default();
             let expected =
-                fallback.nimber_with_parallel_params(&matrix, 0, DEFAULT_GROUPED_PERMIT_FACTOR);
+                fallback.nimber_with_parallel_params(&matrix, 0, DEFAULT_PERMIT_FACTOR);
 
             let default = DfsSolver::default();
             assert_eq!(default.nimber(&matrix), expected);
@@ -1733,7 +1768,7 @@ mod tests {
 
             let depth_three = DfsSolver::default();
             assert_eq!(
-                depth_three.nimber_with_parallel_params(&matrix, 3, DEFAULT_GROUPED_PERMIT_FACTOR),
+                depth_three.nimber_with_parallel_params(&matrix, 3, DEFAULT_PERMIT_FACTOR),
                 expected
             );
             assert!(depth_three.stats().parallel_expansions > 0);

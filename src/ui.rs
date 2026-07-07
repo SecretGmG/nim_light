@@ -22,8 +22,14 @@ use crossterm::{
 
 use crate::{
     board::{Axis, Cell, Maze},
-    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress},
-    game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
+    evaluator::{
+        DEFAULT_PARALLEL_DEPTH, DEFAULT_PERMIT_FACTOR, DfsSolver, Evaluator, EvaluatorConfig,
+        EvaluatorProgress,
+    },
+    game::{
+        Game, Move, PlayerKind, SolverMoveResult, SolverSearchConfig,
+        solver_move_cancellable_with_config,
+    },
     solver::{PseudoCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
     symmetry::InvolutionSymmetryFinder,
@@ -297,6 +303,8 @@ struct Editor {
     target: EditTarget,
     evaluator: Arc<DfsSolver>,
     solver_threads: usize,
+    solver_parallel_depth: usize,
+    solver_permit_factor: usize,
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
@@ -312,6 +320,8 @@ impl Editor {
             target: EditTarget::Node,
             evaluator: new_evaluator(DEFAULT_SOLVER_THREADS),
             solver_threads: DEFAULT_SOLVER_THREADS,
+            solver_parallel_depth: DEFAULT_PARALLEL_DEPTH,
+            solver_permit_factor: DEFAULT_PERMIT_FACTOR,
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
@@ -379,6 +389,35 @@ impl Editor {
             Err(error) => {
                 self.cache_status = Some(format!("failed to change threads: {error}"));
             }
+        }
+    }
+
+    fn adjust_parallel_depth(&mut self, delta: isize) {
+        let depth = self
+            .solver_parallel_depth
+            .saturating_add_signed(delta)
+            .min(MAX_PARALLEL_DEPTH);
+        if depth != self.solver_parallel_depth {
+            self.solver_parallel_depth = depth;
+            self.cache_status = Some(format!("parallel depth set to {depth}"));
+        }
+    }
+
+    fn adjust_permit_factor(&mut self, delta: isize) {
+        let factor = self
+            .solver_permit_factor
+            .saturating_add_signed(delta)
+            .clamp(1, MAX_PERMIT_FACTOR);
+        if factor != self.solver_permit_factor {
+            self.solver_permit_factor = factor;
+            self.cache_status = Some(format!("queue multiplier set to {factor}"));
+        }
+    }
+
+    fn solver_config(&self) -> SolverSearchConfig {
+        SolverSearchConfig {
+            parallel_depth: self.solver_parallel_depth,
+            permit_factor: self.solver_permit_factor,
         }
     }
 
@@ -458,6 +497,8 @@ impl Editor {
 
 const DEFAULT_SOLVER_THREADS: usize = 6;
 const MAX_SOLVER_THREADS: usize = 256;
+const MAX_PARALLEL_DEPTH: usize = 16;
+const MAX_PERMIT_FACTOR: usize = 1024;
 const CACHE_FILE: &str = "nim_light.cache";
 
 fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
