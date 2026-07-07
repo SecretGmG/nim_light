@@ -23,6 +23,9 @@ use crate::{
     symmetry::InvolutionSymmetryFinder,
 };
 
+const DEFAULT_GROUPED_PERMIT_DEPTH: usize = 2;
+const DEFAULT_GROUPED_PERMIT_FACTOR: usize = 8;
+
 /// A conservative zero certificate evaluated after a cache miss.
 pub trait SymmetryFinder: Send + Sync {
     /// `false` means "not proven"; implementations must never guess `true`.
@@ -384,6 +387,24 @@ where
         self.nimber_of_canonical_grouped_parallel(&game, spread_depth)
     }
 
+    pub fn nimber_grouped_permit_parallel(&self, matrix: &BitMatrix) -> usize {
+        self.nimber_grouped_permit_parallel_with(
+            matrix,
+            DEFAULT_GROUPED_PERMIT_DEPTH,
+            DEFAULT_GROUPED_PERMIT_FACTOR,
+        )
+    }
+
+    pub fn nimber_grouped_permit_parallel_with(
+        &self,
+        matrix: &BitMatrix,
+        max_depth: usize,
+        permit_factor: usize,
+    ) -> usize {
+        let game = self.generator.canonicalize(matrix.clone());
+        self.nimber_of_canonical_grouped_permit_parallel(&game, max_depth, permit_factor)
+    }
+
     pub fn nimber_cancellable(
         &self,
         matrix: &BitMatrix,
@@ -416,6 +437,23 @@ where
     ) -> usize {
         self.pool
             .install(|| self.nimber_grouped_inner(game, spread_depth, None))
+            .expect("uncancellable evaluation must not be cancelled")
+    }
+
+    pub fn nimber_of_canonical_grouped_permit_parallel(
+        &self,
+        game: &CanonicalGame,
+        max_depth: usize,
+        permit_factor: usize,
+    ) -> usize {
+        let permits = ParallelPermits::new(
+            self.pool
+                .current_num_threads()
+                .saturating_mul(permit_factor)
+                .max(1),
+        );
+        self.pool
+            .install(|| self.nimber_grouped_permit_inner(game, max_depth, &permits, None))
             .expect("uncancellable evaluation must not be cancelled")
     }
 
@@ -585,6 +623,30 @@ where
         }
     }
 
+    fn nimber_grouped_permit_inner(
+        &self,
+        game: &CanonicalGame,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        match self.try_nimber_grouped_permit(game, depth_remaining, permits, cancel)? {
+            Evaluation::Ready(nimber) => Some(nimber),
+            Evaluation::Busy => {
+                if let Some(nimber) = self.cache.get_done(game) {
+                    self.stats
+                        .completed_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(nimber);
+                }
+                self.evaluate_duplicate(game, self.config.parallel_depth, cancel)
+            }
+        }
+    }
+
     fn try_nimber(
         &self,
         game: &CanonicalGame,
@@ -664,6 +726,49 @@ where
         })
     }
 
+    fn try_nimber_grouped_permit(
+        &self,
+        game: &CanonicalGame,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Evaluation> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if depth_remaining == 0 {
+            return self.try_nimber(game, self.config.parallel_depth, cancel);
+        }
+        if game.is_empty() {
+            return Some(Evaluation::Ready(0));
+        }
+
+        Some(match self.cache.probe(game) {
+            CacheProbe::Done(nimber) => {
+                self.stats
+                    .completed_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                Evaluation::Ready(nimber)
+            }
+            CacheProbe::Busy => {
+                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                Evaluation::Busy
+            }
+            CacheProbe::Claimed => {
+                self.stats
+                    .unique_positions_claimed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .evaluation_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let nimber =
+                    self.compute_position_grouped_permit(game, depth_remaining, permits, cancel)?;
+                self.cache_result(game.clone(), nimber);
+                Evaluation::Ready(nimber)
+            }
+        })
+    }
+
     fn compute_position(
         &self,
         game: &CanonicalGame,
@@ -729,6 +834,31 @@ where
             nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
         } else {
             self.nimber_of_component_grouped(&game.components()[0], spread_depth, cancel)
+        }
+    }
+
+    fn compute_position_grouped_permit(
+        &self,
+        game: &CanonicalGame,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if depth_remaining == 0 {
+            return self.compute_position(game, self.config.parallel_depth, cancel);
+        }
+        if game.components().len() > 1 {
+            self.nimber_of_components_grouped_permit(game, depth_remaining, permits, cancel)
+        } else {
+            self.nimber_of_component_grouped_permit(
+                &game.components()[0],
+                depth_remaining,
+                permits,
+                cancel,
+            )
         }
     }
 
@@ -967,6 +1097,175 @@ where
         Some(worker.reachable.mex())
     }
 
+    fn nimber_of_components_grouped_permit(
+        &self,
+        game: &CanonicalGame,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        let component_count = game.components().len();
+        let parallel_count = permits.acquire_up_to(component_count);
+        if parallel_count == 0 {
+            let mut nimber = 0;
+            for index in 0..component_count {
+                nimber ^=
+                    self.nimber_inner(&game.component(index), self.config.parallel_depth, cancel)?;
+            }
+            return Some(nimber);
+        }
+
+        self.stats
+            .parallel_expansions
+            .fetch_add(1, Ordering::Relaxed);
+        let (parallel, local) = rayon::join(
+            || {
+                let nimbers: Option<Vec<_>> = (0..parallel_count)
+                    .into_par_iter()
+                    .map(|index| {
+                        self.nimber_grouped_permit_inner(
+                            &game.component(index),
+                            depth_remaining - 1,
+                            permits,
+                            cancel,
+                        )
+                    })
+                    .collect();
+                permits.release(parallel_count);
+                nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
+            },
+            || {
+                let mut nimber = 0;
+                for index in parallel_count..component_count {
+                    nimber ^= self.nimber_inner(
+                        &game.component(index),
+                        self.config.parallel_depth,
+                        cancel,
+                    )?;
+                }
+                Some(nimber)
+            },
+        );
+        Some(parallel? ^ local?)
+    }
+
+    fn nimber_of_component_grouped_permit(
+        &self,
+        component: &BitMatrix,
+        depth_remaining: usize,
+        permits: &ParallelPermits,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if depth_remaining == 0 {
+            return self.nimber_of_component(component, self.config.parallel_depth, cancel);
+        }
+        if self.symmetry_finder.proves_zero(component) {
+            self.stats
+                .symmetry_zero_certificates
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(0);
+        }
+
+        let bound = component.count_ones() + 1;
+        let mut groups: Vec<_> = self.generator.successor_groups(component).collect();
+        let parallel_count = permits.acquire_up_to(groups.len());
+        let local_groups = groups.split_off(parallel_count);
+
+        if parallel_count == 0 {
+            let mut worker = WorkerResult::new(bound);
+            self.evaluate_successor_groups_dfs(local_groups, &mut worker, cancel);
+            if worker.cancelled {
+                return None;
+            }
+            return Some(worker.reachable.mex());
+        }
+
+        self.stats
+            .parallel_expansions
+            .fetch_add(1, Ordering::Relaxed);
+        let (parallel_worker, local_worker) = rayon::join(
+            || {
+                let worker = groups
+                    .into_par_iter()
+                    .fold(
+                        || WorkerResult::new(bound),
+                        |mut worker, group| {
+                            for successor in group {
+                                if is_cancelled(cancel) {
+                                    worker.cancelled = true;
+                                    break;
+                                }
+                                worker.push(
+                                    self.try_nimber_grouped_permit(
+                                        &successor,
+                                        depth_remaining - 1,
+                                        permits,
+                                        cancel,
+                                    ),
+                                    successor,
+                                );
+                            }
+                            worker
+                        },
+                    )
+                    .map(|mut worker| {
+                        self.resolve_pending(&mut worker, self.config.parallel_depth, cancel);
+                        worker
+                    })
+                    .reduce(
+                        || WorkerResult::new(bound),
+                        |mut left, right| {
+                            left.cancelled |= right.cancelled;
+                            left.reachable.union_with(&right.reachable);
+                            left
+                        },
+                    );
+                permits.release(parallel_count);
+                worker
+            },
+            || {
+                let mut worker = WorkerResult::new(bound);
+                self.evaluate_successor_groups_dfs(local_groups, &mut worker, cancel);
+                worker
+            },
+        );
+
+        let mut worker = parallel_worker;
+        worker.cancelled |= local_worker.cancelled;
+        worker.reachable.union_with(&local_worker.reachable);
+        if worker.cancelled {
+            return None;
+        }
+        Some(worker.reachable.mex())
+    }
+
+    fn evaluate_successor_groups_dfs<I, H>(
+        &self,
+        groups: I,
+        worker: &mut WorkerResult,
+        cancel: Option<&AtomicBool>,
+    ) where
+        I: IntoIterator<Item = H>,
+        H: IntoIterator<Item = CanonicalGame>,
+    {
+        for group in groups {
+            for successor in group {
+                if is_cancelled(cancel) {
+                    worker.cancelled = true;
+                    return;
+                }
+                worker.push(
+                    self.try_nimber(&successor, self.config.parallel_depth, cancel),
+                    successor,
+                );
+            }
+        }
+        self.resolve_pending(worker, self.config.parallel_depth, cancel);
+    }
+
     fn resolve_pending(
         &self,
         worker: &mut WorkerResult,
@@ -1040,6 +1339,41 @@ impl WorkerResult {
             Some(Evaluation::Busy) => self.pending.push(game),
             None => self.cancelled = true,
         }
+    }
+}
+
+struct ParallelPermits {
+    available: AtomicUsize,
+}
+
+impl ParallelPermits {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: AtomicUsize::new(permits),
+        }
+    }
+
+    fn acquire_up_to(&self, requested: usize) -> usize {
+        let mut current = self.available.load(Ordering::Relaxed);
+        loop {
+            if current == 0 || requested == 0 {
+                return 0;
+            }
+            let acquired = requested.min(current);
+            match self.available.compare_exchange_weak(
+                current,
+                current - acquired,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return acquired,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn release(&self, permits: usize) {
+        self.available.fetch_add(permits, Ordering::Release);
     }
 }
 
@@ -1462,6 +1796,21 @@ mod tests {
                 );
                 assert!(grouped.stats().parallel_expansions > 0);
             }
+        }
+    }
+
+    #[test]
+    fn grouped_permit_parallel_evaluator_agrees_with_regular_evaluator() {
+        for matrix in [
+            heap(6),
+            dense_rectangle(3, 4),
+            dense_rectangle(2, 5),
+            spiral_maze_game(3, 3),
+        ] {
+            let expected = DfsSolver::default().nimber(&matrix);
+            let grouped = DfsSolver::default();
+            assert_eq!(grouped.nimber_grouped_permit_parallel(&matrix), expected);
+            assert!(grouped.stats().parallel_expansions > 0);
         }
     }
 

@@ -191,6 +191,31 @@ fn grouped_parallel_ab(c: &mut Criterion) {
     }
 }
 
+fn grouped_permit_parallel_ab(c: &mut Criterion) {
+    let threads = bench_threads();
+    for (label, game) in labelled_benchmark_games() {
+        c.bench_function(
+            &format!("grouped_permit_parallel/{threads}_threads/current/{label}"),
+            |bencher| {
+                bencher.iter(|| {
+                    let evaluator = new_evaluator_with_threads(threads);
+                    black_box(evaluator.nimber(&game));
+                });
+            },
+        );
+
+        c.bench_function(
+            &format!("grouped_permit_parallel/{threads}_threads/default/{label}"),
+            |bencher| {
+                bencher.iter(|| {
+                    let evaluator = new_evaluator_with_threads(threads);
+                    black_box(evaluator.nimber_grouped_permit_parallel(&game));
+                });
+            },
+        );
+    }
+}
+
 fn new_evaluator() -> DfsSolver {
     new_evaluator_with_threads(8)
 }
@@ -447,6 +472,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(30));
-    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, root_parallel_ab, grouped_parallel_ab
+    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, root_parallel_ab, grouped_parallel_ab, grouped_permit_parallel_ab
 }
 criterion_main!(benches);
