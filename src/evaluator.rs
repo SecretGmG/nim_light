@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{self, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -264,20 +264,6 @@ impl ShardedCache {
         profile
     }
 
-    fn done_len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .lock()
-                    .expect("cache shard poisoned")
-                    .values()
-                    .filter(|entry| matches!(entry, CacheEntry::Done(_)))
-                    .count()
-            })
-            .sum()
-    }
-
     fn clone_done_into_shards(&self, shard_count: usize) -> Self {
         let copied = Self::new(shard_count);
         for shard in &self.shards {
@@ -299,23 +285,36 @@ impl ShardedCache {
     }
 
     fn save_to(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
-        let mut file = File::create(path)?;
-        let entries = self.done_len();
+        let mut file = BufWriter::new(File::create(path)?);
         file.write_all(CACHE_FILE_MAGIC)?;
-        write_u64(&mut file, entries)?;
+        write_u64(&mut file, 0)?;
+        let mut entries = 0;
         for shard in &self.shards {
-            let guard = shard.lock().expect("cache shard poisoned");
-            for (game, entry) in guard.iter() {
-                if let CacheEntry::Done(nimber) = entry {
-                    write_cache_entry(&mut file, game, *nimber)?;
-                }
+            let shard_entries: Vec<_> = {
+                let guard = shard.lock().expect("cache shard poisoned");
+                guard
+                    .iter()
+                    .filter_map(|(game, entry)| match entry {
+                        CacheEntry::Done(nimber) => Some((game.clone(), *nimber)),
+                        CacheEntry::Processing => None,
+                    })
+                    .collect()
+            };
+
+            entries += shard_entries.len();
+            for (game, nimber) in shard_entries {
+                write_cache_entry(&mut file, &game, nimber)?;
             }
         }
+        file.flush()?;
+        file.seek(SeekFrom::Start(CACHE_FILE_MAGIC.len() as u64))?;
+        write_u64(&mut file, entries)?;
+        file.flush()?;
         Ok(CacheIoReport { entries })
     }
 
     fn load_from(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
-        let mut file = File::open(path)?;
+        let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; CACHE_FILE_MAGIC.len()];
         file.read_exact(&mut magic)?;
         if &magic != CACHE_FILE_MAGIC {
