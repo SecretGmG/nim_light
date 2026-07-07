@@ -638,12 +638,7 @@ where
     ) -> Option<usize> {
         let permits = self.parallel_permits(permit_factor);
         let nimber = self.pool.install(|| {
-            self.nimber_grouped_permit_inner(
-                game,
-                max_depth,
-                &permits,
-                Some(cancel.as_ref()),
-            )
+            self.nimber_grouped_permit_inner(game, max_depth, &permits, Some(cancel.as_ref()))
         });
         if nimber.is_none() {
             self.cache.clear_processing();
@@ -1759,8 +1754,7 @@ mod tests {
             spiral_maze_game(3, 3),
         ] {
             let fallback = DfsSolver::default();
-            let expected =
-                fallback.nimber_with_parallel_params(&matrix, 0, DEFAULT_PERMIT_FACTOR);
+            let expected = fallback.nimber_with_parallel_params(&matrix, 0, DEFAULT_PERMIT_FACTOR);
 
             let default = DfsSolver::default();
             assert_eq!(default.nimber(&matrix), expected);

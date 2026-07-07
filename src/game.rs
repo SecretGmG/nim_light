@@ -259,15 +259,12 @@ impl SolverSearch<'_> {
             let mut next = self.maze.clone();
             next.apply_move(movement.axis, movement.anchor, &movement.cells)
                 .expect("generated solver moves must be legal");
-            return match self
-                .solver
-                .nimber_cancellable_with_parallel_params(
-                    &compile_maze(&next),
-                    self.config.parallel_depth,
-                    self.config.permit_factor,
-                    self.cancel,
-                )
-            {
+            return match self.solver.nimber_cancellable_with_parallel_params(
+                &compile_maze(&next),
+                self.config.parallel_depth,
+                self.config.permit_factor,
+                self.cancel,
+            ) {
                 Some(0) => SolverMoveResult::Move(movement),
                 Some(_) => SolverMoveResult::NoMove,
                 None => SolverMoveResult::Cancelled,

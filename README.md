@@ -45,6 +45,8 @@ c               clear cache
 S               save completed cache entries to nim_light.cache
 L               load completed cache entries from nim_light.cache
 [ / ]           decrease / increase solver threads without clearing cache
+d / D           decrease / increase parallel depth
+f / F           decrease / increase task queue multiplier
 + / -           resize rows
 < / >           resize columns
 r               reset to demo board
@@ -57,6 +59,10 @@ Thread changes preserve completed cache entries and rebuild the evaluator with
 a cache shard count appropriate for the new thread count. In-flight
 `Processing` sentinels are not preserved because they are only meaningful
 during one active computation.
+
+The parallel depth and queue multiplier affect both editor nimber computation
+and solver CPU move search. The default settings are depth `2` and queue
+multiplier `16`.
 
 ## Solver notes
 
@@ -105,4 +111,3 @@ The benchmark includes:
 - `depth_0_dfs_fallback`
 - `depth_2_default`
 - `depth_3`
-

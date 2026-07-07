@@ -807,8 +807,12 @@ fn run_cpu_turn(
     let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
-        let result =
-            solver_move_cancellable_with_config(&maze, &worker_solver, solver_config, &worker_cancel);
+        let result = solver_move_cancellable_with_config(
+            &maze,
+            &worker_solver,
+            solver_config,
+            &worker_cancel,
+        );
         let _ = sender.send(result);
     });
 
