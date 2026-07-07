@@ -7,10 +7,18 @@ pub trait SuccessorGenerator: Send + Sync {
     type Successors<'a>: Iterator<Item = CanonicalGame> + Send + 'a
     where
         Self: 'a;
+    type SuccessorGroups<'a>: Iterator<Item = Self::SuccessorGroup<'a>> + Send + 'a
+    where
+        Self: 'a;
+    type SuccessorGroup<'a>: Iterator<Item = CanonicalGame> + Send + 'a
+    where
+        Self: 'a;
 
     fn canonicalize(&self, matrix: BitMatrix) -> CanonicalGame;
 
     fn successors<'a>(&'a self, component: &'a BitMatrix) -> Self::Successors<'a>;
+
+    fn successor_groups<'a>(&'a self, component: &'a BitMatrix) -> Self::SuccessorGroups<'a>;
 
     fn estimated_successors(&self, component: &BitMatrix) -> usize;
 }
@@ -48,8 +56,9 @@ where
 {
     pub fn ordered_successors(&self, component: &BitMatrix) -> Vec<OrderedSuccessor> {
         let original_nodes = component.count_ones();
-        let mut raw_successors = CanonicalSuccessors::new(component, &self.canonicalizer);
-        let mut successors: Vec<_> = std::iter::from_fn(|| raw_successors.next_with_raw_count())
+        let mut successors: Vec<_> = self
+            .successor_groups(component)
+            .flat_map(|group| group.with_raw_counts())
             .filter_map(|successor| {
                 let removed_nodes = original_nodes.checked_sub(successor.raw_count_ones)?;
                 Some(OrderedSuccessor {
@@ -71,13 +80,25 @@ where
         = CanonicalSuccessors<'a, C>
     where
         C: 'a;
+    type SuccessorGroups<'a>
+        = CanonicalSuccessorGroups<'a, C>
+    where
+        C: 'a;
+    type SuccessorGroup<'a>
+        = CanonicalSuccessorGroup<'a, C>
+    where
+        C: 'a;
 
     fn canonicalize(&self, matrix: BitMatrix) -> CanonicalGame {
         self.canonicalizer.canonicalize(matrix)
     }
 
     fn successors<'a>(&'a self, component: &'a BitMatrix) -> Self::Successors<'a> {
-        CanonicalSuccessors::new(component, &self.canonicalizer)
+        CanonicalSuccessors::new(self.successor_groups(component))
+    }
+
+    fn successor_groups<'a>(&'a self, component: &'a BitMatrix) -> Self::SuccessorGroups<'a> {
+        CanonicalSuccessorGroups::new(component, &self.canonicalizer)
     }
 
     fn estimated_successors(&self, component: &BitMatrix) -> usize {
@@ -87,21 +108,51 @@ where
 }
 
 pub struct CanonicalSuccessors<'a, C> {
+    groups: CanonicalSuccessorGroups<'a, C>,
+    current: Option<CanonicalSuccessorGroup<'a, C>>,
+}
+
+impl<'a, C> CanonicalSuccessors<'a, C>
+where
+    C: Canonicalizer,
+{
+    fn new(groups: CanonicalSuccessorGroups<'a, C>) -> Self {
+        Self {
+            groups,
+            current: None,
+        }
+    }
+}
+
+impl<C> Iterator for CanonicalSuccessors<'_, C>
+where
+    C: Canonicalizer,
+{
+    type Item = CanonicalGame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(group) = &mut self.current
+                && let Some(successor) = group.next()
+            {
+                return Some(successor);
+            }
+            self.current = self.groups.next();
+            self.current.as_ref()?;
+        }
+    }
+}
+
+pub struct CanonicalSuccessorGroups<'a, C> {
     canonicalizer: &'a C,
     orientations: [BitMatrix; 2],
     orientation: usize,
     row: usize,
     column_counts: Vec<usize>,
-    shared_candidates: Vec<u64>,
-    shared_removed: Vec<u64>,
-    leaf_columns: Vec<usize>,
-    leaf_removed: Vec<u64>,
-    leaf_count: usize,
-    row_ready: bool,
     previous_row: Option<Vec<u64>>,
 }
 
-impl<'a, C> CanonicalSuccessors<'a, C>
+impl<'a, C> CanonicalSuccessorGroups<'a, C>
 where
     C: Canonicalizer,
 {
@@ -114,50 +165,23 @@ where
             orientation: 0,
             row: 0,
             column_counts,
-            shared_candidates: Vec::new(),
-            shared_removed: Vec::new(),
-            leaf_columns: Vec::new(),
-            leaf_removed: Vec::new(),
-            leaf_count: 0,
-            row_ready: false,
             previous_row: None,
         }
     }
+}
 
-    fn next_raw(&mut self) -> Option<BitMatrix> {
-        loop {
-            if !self.row_ready && !self.prepare_row() {
-                return None;
-            }
+impl<'a, C> Iterator for CanonicalSuccessorGroups<'a, C>
+where
+    C: Canonicalizer,
+{
+    type Item = CanonicalSuccessorGroup<'a, C>;
 
-            if self.leaf_count < self.leaf_columns.len() {
-                let col = self.leaf_columns[self.leaf_count];
-                self.leaf_removed[col / 64] |= 1 << (col % 64);
-                self.leaf_count += 1;
-            } else {
-                self.leaf_count = 0;
-                self.leaf_removed.fill(0);
-                if !increment_masked(&mut self.shared_removed, &self.shared_candidates) {
-                    self.row += 1;
-                    self.row_ready = false;
-                    continue;
-                }
-            }
-
-            let matrix = &self.orientations[self.orientation];
-            let mut result = matrix.clone();
-            result.clear_row_bits(self.row, &self.shared_removed);
-            result.clear_row_bits(self.row, &self.leaf_removed);
-            return Some(result);
-        }
-    }
-
-    fn prepare_row(&mut self) -> bool {
+    fn next(&mut self) -> Option<Self::Item> {
         loop {
             while self.row == self.orientations[self.orientation].rows() {
                 self.orientation += 1;
                 if self.orientation == self.orientations.len() {
-                    return false;
+                    return None;
                 }
                 self.row = 0;
                 self.column_counts = column_counts(&self.orientations[self.orientation]);
@@ -166,37 +190,84 @@ where
                 self.previous_row = None;
             }
 
-            let row_pattern = self.orientations[self.orientation]
-                .row_words(self.row)
-                .to_vec();
-            if self.previous_row.as_ref() != Some(&row_pattern) {
-                self.previous_row = Some(row_pattern);
-                break;
+            let matrix = &self.orientations[self.orientation];
+            let row_pattern = matrix.row_words(self.row).to_vec();
+            if self.previous_row.as_ref() == Some(&row_pattern) {
+                self.row += 1;
+                continue;
             }
+            self.previous_row = Some(row_pattern);
+
+            let word_count = matrix.cols().div_ceil(64);
+            let mut shared_candidates = vec![0; word_count];
+            let mut leaf_columns = Vec::new();
+            for col in matrix.row_ones(self.row) {
+                if self.column_counts[col] == 1 {
+                    leaf_columns.push(col);
+                } else {
+                    shared_candidates[col / 64] |= 1 << (col % 64);
+                }
+            }
+            let group = CanonicalSuccessorGroup {
+                canonicalizer: self.canonicalizer,
+                matrix: matrix.clone(),
+                row: self.row,
+                shared_candidates,
+                shared_removed: vec![0; word_count],
+                leaf_columns,
+                leaf_removed: vec![0; word_count],
+                leaf_count: 0,
+            };
             self.row += 1;
+            return Some(group);
         }
-
-        let matrix = &self.orientations[self.orientation];
-        let word_count = matrix.cols().div_ceil(64);
-        self.shared_candidates = vec![0; word_count];
-        self.shared_removed = vec![0; word_count];
-        self.leaf_columns.clear();
-        self.leaf_removed = vec![0; word_count];
-        self.leaf_count = 0;
-
-        for col in matrix.row_ones(self.row) {
-            if self.column_counts[col] == 1 {
-                self.leaf_columns.push(col);
-            } else {
-                self.shared_candidates[col / 64] |= 1 << (col % 64);
-            }
-        }
-        self.row_ready = true;
-        true
     }
 }
 
-impl<C> Iterator for CanonicalSuccessors<'_, C>
+pub struct CanonicalSuccessorGroup<'a, C> {
+    canonicalizer: &'a C,
+    matrix: BitMatrix,
+    row: usize,
+    shared_candidates: Vec<u64>,
+    shared_removed: Vec<u64>,
+    leaf_columns: Vec<usize>,
+    leaf_removed: Vec<u64>,
+    leaf_count: usize,
+}
+
+impl<'a, C> CanonicalSuccessorGroup<'a, C>
+where
+    C: Canonicalizer,
+{
+    fn next_raw(&mut self) -> Option<BitMatrix> {
+        if self.leaf_columns.is_empty() && self.shared_candidates.iter().all(|&word| word == 0) {
+            return None;
+        }
+
+        if self.leaf_count < self.leaf_columns.len() {
+            let col = self.leaf_columns[self.leaf_count];
+            self.leaf_removed[col / 64] |= 1 << (col % 64);
+            self.leaf_count += 1;
+        } else {
+            self.leaf_count = 0;
+            self.leaf_removed.fill(0);
+            if !increment_masked(&mut self.shared_removed, &self.shared_candidates) {
+                return None;
+            }
+        }
+
+        let mut result = self.matrix.clone();
+        result.clear_row_bits(self.row, &self.shared_removed);
+        result.clear_row_bits(self.row, &self.leaf_removed);
+        Some(result)
+    }
+
+    fn with_raw_counts(self) -> CanonicalSuccessorGroupWithRawCounts<'a, C> {
+        CanonicalSuccessorGroupWithRawCounts { group: self }
+    }
+}
+
+impl<C> Iterator for CanonicalSuccessorGroup<'_, C>
 where
     C: Canonicalizer,
 {
@@ -213,16 +284,22 @@ struct RawCanonicalSuccessor {
     game: CanonicalGame,
 }
 
-impl<'a, C> CanonicalSuccessors<'a, C>
+struct CanonicalSuccessorGroupWithRawCounts<'a, C> {
+    group: CanonicalSuccessorGroup<'a, C>,
+}
+
+impl<C> Iterator for CanonicalSuccessorGroupWithRawCounts<'_, C>
 where
     C: Canonicalizer,
 {
-    fn next_with_raw_count(&mut self) -> Option<RawCanonicalSuccessor> {
-        self.next_raw().map(|raw| {
+    type Item = RawCanonicalSuccessor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.group.next_raw().map(|raw| {
             let raw_count_ones = raw.count_ones();
             RawCanonicalSuccessor {
                 raw_count_ones,
-                game: self.canonicalizer.canonicalize(raw),
+                game: self.group.canonicalizer.canonicalize(raw),
             }
         })
     }

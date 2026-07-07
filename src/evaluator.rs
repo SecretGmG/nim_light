@@ -379,6 +379,11 @@ where
         self.nimber_of_canonical_root_parallel(&game)
     }
 
+    pub fn nimber_grouped_parallel(&self, matrix: &BitMatrix, spread_depth: usize) -> usize {
+        let game = self.generator.canonicalize(matrix.clone());
+        self.nimber_of_canonical_grouped_parallel(&game, spread_depth)
+    }
+
     pub fn nimber_cancellable(
         &self,
         matrix: &BitMatrix,
@@ -401,6 +406,16 @@ where
     pub fn nimber_of_canonical_root_parallel(&self, game: &CanonicalGame) -> usize {
         self.pool
             .install(|| self.nimber_root_parallel_inner(game, None))
+            .expect("uncancellable evaluation must not be cancelled")
+    }
+
+    pub fn nimber_of_canonical_grouped_parallel(
+        &self,
+        game: &CanonicalGame,
+        spread_depth: usize,
+    ) -> usize {
+        self.pool
+            .install(|| self.nimber_grouped_inner(game, spread_depth, None))
             .expect("uncancellable evaluation must not be cancelled")
     }
 
@@ -547,6 +562,29 @@ where
         })
     }
 
+    fn nimber_grouped_inner(
+        &self,
+        game: &CanonicalGame,
+        spread_depth: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        match self.try_nimber_grouped(game, spread_depth, cancel)? {
+            Evaluation::Ready(nimber) => Some(nimber),
+            Evaluation::Busy => {
+                if let Some(nimber) = self.cache.get_done(game) {
+                    self.stats
+                        .completed_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(nimber);
+                }
+                self.evaluate_duplicate(game, self.config.parallel_depth, cancel)
+            }
+        }
+    }
+
     fn try_nimber(
         &self,
         game: &CanonicalGame,
@@ -579,6 +617,47 @@ where
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
                 let nimber = self.compute_position(game, parallel_depth, cancel)?;
+                self.cache_result(game.clone(), nimber);
+                Evaluation::Ready(nimber)
+            }
+        })
+    }
+
+    fn try_nimber_grouped(
+        &self,
+        game: &CanonicalGame,
+        spread_depth: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Evaluation> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if spread_depth == 0 {
+            return self.try_nimber(game, self.config.parallel_depth, cancel);
+        }
+        if game.is_empty() {
+            return Some(Evaluation::Ready(0));
+        }
+
+        Some(match self.cache.probe(game) {
+            CacheProbe::Done(nimber) => {
+                self.stats
+                    .completed_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                Evaluation::Ready(nimber)
+            }
+            CacheProbe::Busy => {
+                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                Evaluation::Busy
+            }
+            CacheProbe::Claimed => {
+                self.stats
+                    .unique_positions_claimed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .evaluation_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let nimber = self.compute_position_grouped(game, spread_depth, cancel)?;
                 self.cache_result(game.clone(), nimber);
                 Evaluation::Ready(nimber)
             }
@@ -622,6 +701,34 @@ where
             nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
         } else {
             self.nimber_of_component_root_parallel(&game.components()[0], cancel)
+        }
+    }
+
+    fn compute_position_grouped(
+        &self,
+        game: &CanonicalGame,
+        spread_depth: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if spread_depth == 0 {
+            return self.compute_position(game, self.config.parallel_depth, cancel);
+        }
+        if game.components().len() > 1 {
+            self.stats
+                .parallel_expansions
+                .fetch_add(1, Ordering::Relaxed);
+            let nimbers: Option<Vec<_>> = (0..game.components().len())
+                .into_par_iter()
+                .map(|index| {
+                    self.nimber_grouped_inner(&game.component(index), spread_depth - 1, cancel)
+                })
+                .collect();
+            nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
+        } else {
+            self.nimber_of_component_grouped(&game.components()[0], spread_depth, cancel)
         }
     }
 
@@ -776,6 +883,66 @@ where
                     } else {
                         worker.push(
                             self.try_nimber(&successor, self.config.parallel_depth, cancel),
+                            successor,
+                        );
+                    }
+                    worker
+                },
+            )
+            .map(|mut worker| {
+                self.resolve_pending(&mut worker, self.config.parallel_depth, cancel);
+                worker
+            })
+            .reduce(
+                || WorkerResult::new(bound),
+                |mut left, right| {
+                    left.cancelled |= right.cancelled;
+                    left.reachable.union_with(&right.reachable);
+                    left
+                },
+            );
+        if worker.cancelled {
+            return None;
+        }
+        Some(worker.reachable.mex())
+    }
+
+    fn nimber_of_component_grouped(
+        &self,
+        component: &BitMatrix,
+        spread_depth: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if spread_depth == 0 {
+            return self.nimber_of_component(component, self.config.parallel_depth, cancel);
+        }
+        if self.symmetry_finder.proves_zero(component) {
+            self.stats
+                .symmetry_zero_certificates
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(0);
+        }
+
+        self.stats
+            .parallel_expansions
+            .fetch_add(1, Ordering::Relaxed);
+        let bound = component.count_ones() + 1;
+        let groups: Vec<_> = self.generator.successor_groups(component).collect();
+        let worker = groups
+            .into_par_iter()
+            .fold(
+                || WorkerResult::new(bound),
+                |mut worker, group| {
+                    for successor in group {
+                        if is_cancelled(cancel) {
+                            worker.cancelled = true;
+                            break;
+                        }
+                        worker.push(
+                            self.try_nimber_grouped(&successor, spread_depth - 1, cancel),
                             successor,
                         );
                     }
@@ -1275,6 +1442,26 @@ mod tests {
                 regular.nimber(&matrix)
             );
             assert!(root_parallel.stats().parallel_expansions > 0);
+        }
+    }
+
+    #[test]
+    fn grouped_parallel_evaluator_agrees_with_regular_evaluator() {
+        for matrix in [
+            heap(6),
+            dense_rectangle(3, 4),
+            dense_rectangle(2, 5),
+            spiral_maze_game(3, 3),
+        ] {
+            let expected = DfsSolver::default().nimber(&matrix);
+            for spread_depth in 1..=3 {
+                let grouped = DfsSolver::default();
+                assert_eq!(
+                    grouped.nimber_grouped_parallel(&matrix, spread_depth),
+                    expected
+                );
+                assert!(grouped.stats().parallel_expansions > 0);
+            }
         }
     }
 
