@@ -22,14 +22,8 @@ use crossterm::{
 
 use crate::{
     board::{Axis, Cell, Maze},
-    evaluator::{
-        DEFAULT_PARALLEL_DEPTH, DEFAULT_PERMIT_FACTOR, DfsSolver, Evaluator, EvaluatorConfig,
-        EvaluatorProgress,
-    },
-    game::{
-        Game, Move, PlayerKind, SolverMoveResult, SolverSearchConfig,
-        solver_move_cancellable_with_config,
-    },
+    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress},
+    game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
     solver::{PseudoCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
     symmetry::InvolutionSymmetryFinder,
@@ -223,7 +217,6 @@ pub fn run() -> io::Result<()> {
                     &mut game,
                     Arc::clone(&editor.evaluator),
                     editor.solver_threads,
-                    editor.solver_config(),
                 )? {
                     PostGame::Menu => {}
                     PostGame::Quit => return Ok(()),
@@ -236,7 +229,6 @@ pub fn run() -> io::Result<()> {
                     &mut game,
                     Arc::clone(&editor.evaluator),
                     editor.solver_threads,
-                    editor.solver_config(),
                 )? {
                     PostGame::Menu => {}
                     PostGame::Quit => return Ok(()),
@@ -305,8 +297,6 @@ struct Editor {
     target: EditTarget,
     evaluator: Arc<DfsSolver>,
     solver_threads: usize,
-    solver_parallel_depth: usize,
-    solver_permit_factor: usize,
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
@@ -322,8 +312,6 @@ impl Editor {
             target: EditTarget::Node,
             evaluator: new_evaluator(DEFAULT_SOLVER_THREADS),
             solver_threads: DEFAULT_SOLVER_THREADS,
-            solver_parallel_depth: DEFAULT_PARALLEL_DEPTH,
-            solver_permit_factor: DEFAULT_PERMIT_FACTOR,
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
@@ -391,35 +379,6 @@ impl Editor {
             Err(error) => {
                 self.cache_status = Some(format!("failed to change threads: {error}"));
             }
-        }
-    }
-
-    fn adjust_parallel_depth(&mut self, delta: isize) {
-        let depth = self
-            .solver_parallel_depth
-            .saturating_add_signed(delta)
-            .min(MAX_PARALLEL_DEPTH);
-        if depth != self.solver_parallel_depth {
-            self.solver_parallel_depth = depth;
-            self.cache_status = Some(format!("parallel depth set to {depth}"));
-        }
-    }
-
-    fn adjust_permit_factor(&mut self, delta: isize) {
-        let factor = self
-            .solver_permit_factor
-            .saturating_add_signed(delta)
-            .clamp(1, MAX_PERMIT_FACTOR);
-        if factor != self.solver_permit_factor {
-            self.solver_permit_factor = factor;
-            self.cache_status = Some(format!("queue multiplier set to {factor}"));
-        }
-    }
-
-    fn solver_config(&self) -> SolverSearchConfig {
-        SolverSearchConfig {
-            parallel_depth: self.solver_parallel_depth,
-            permit_factor: self.solver_permit_factor,
         }
     }
 
@@ -499,8 +458,6 @@ impl Editor {
 
 const DEFAULT_SOLVER_THREADS: usize = 6;
 const MAX_SOLVER_THREADS: usize = 256;
-const MAX_PARALLEL_DEPTH: usize = 16;
-const MAX_PERMIT_FACTOR: usize = 1024;
 const CACHE_FILE: &str = "nim_light.cache";
 
 fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
@@ -552,10 +509,6 @@ fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGa
                 KeyCode::Char('L') => editor.load_cache(),
                 KeyCode::Char('[') => editor.adjust_solver_threads(-1),
                 KeyCode::Char(']') => editor.adjust_solver_threads(1),
-                KeyCode::Char('d') => editor.adjust_parallel_depth(-1),
-                KeyCode::Char('D') => editor.adjust_parallel_depth(1),
-                KeyCode::Char('f') => editor.adjust_permit_factor(-1),
-                KeyCode::Char('F') => editor.adjust_permit_factor(1),
                 KeyCode::Char('r') => editor.reset_demo(),
                 KeyCode::Char('o') => editor.reset_open(),
                 KeyCode::Char('+') | KeyCode::Char('=') => editor.resize(1, 0),
@@ -575,7 +528,6 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
     let report_shape = (matrix.rows(), matrix.cols(), matrix.count_ones());
     let evaluator = Arc::clone(&editor.evaluator);
     let worker_evaluator = Arc::clone(&evaluator);
-    let solver_config = editor.solver_config();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::channel();
@@ -583,12 +535,7 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
     let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
-        let nimber = worker_evaluator.nimber_cancellable_with_parallel_params(
-            &matrix,
-            solver_config.parallel_depth,
-            solver_config.permit_factor,
-            &worker_cancel,
-        );
+        let nimber = worker_evaluator.nimber_cancellable(&matrix, &worker_cancel);
         let _ = sender.send(nimber);
     });
 
@@ -644,7 +591,6 @@ fn play_game(
     game: &mut Game,
     solver: Arc<DfsSolver>,
     solver_threads: usize,
-    solver_config: SolverSearchConfig,
 ) -> io::Result<PostGame> {
     let mut selection = Selection::new();
     let mut last_space = None;
@@ -659,8 +605,6 @@ fn play_game(
             status: "Solver cache",
             progress: ProgressView::fresh(solver.progress()),
             threads: solver_threads,
-            parallel_depth: solver_config.parallel_depth,
-            permit_factor: solver_config.permit_factor,
         });
         render(stdout, game, &selection, panel)?;
 
@@ -694,7 +638,6 @@ fn play_game(
                 &selection,
                 Arc::clone(&solver),
                 solver_threads,
-                solver_config,
             )? {
                 CpuTurn::Played => {}
                 CpuTurn::Cancelled => return Ok(PostGame::Menu),
@@ -737,8 +680,6 @@ fn play_game(
                             status: "Solver cache",
                             progress: ProgressView::fresh(solver.progress()),
                             threads: solver_threads,
-                            parallel_depth: solver_config.parallel_depth,
-                            permit_factor: solver_config.permit_factor,
                         });
                         let select = last_space
                             .as_ref()
@@ -780,8 +721,6 @@ struct SolverPanel {
     status: &'static str,
     progress: ProgressView,
     threads: usize,
-    parallel_depth: usize,
-    permit_factor: usize,
 }
 
 enum CpuTurn {
@@ -796,7 +735,6 @@ fn run_cpu_turn(
     selection: &Selection,
     solver: Arc<DfsSolver>,
     solver_threads: usize,
-    solver_config: SolverSearchConfig,
 ) -> io::Result<CpuTurn> {
     let maze = game.maze.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -807,12 +745,7 @@ fn run_cpu_turn(
     let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
-        let result = solver_move_cancellable_with_config(
-            &maze,
-            &worker_solver,
-            solver_config,
-            &worker_cancel,
-        );
+        let result = solver_move_cancellable(&maze, &worker_solver, &worker_cancel);
         let _ = sender.send(result);
     });
 
@@ -837,8 +770,6 @@ fn run_cpu_turn(
                         status,
                         progress: progress.sample(&solver),
                         threads: solver_threads,
-                        parallel_depth: solver_config.parallel_depth,
-                        permit_factor: solver_config.permit_factor,
                     }),
                 )?;
                 queue!(
@@ -971,10 +902,7 @@ fn render(
             stdout,
             Print("\r\n\r\n"),
             Print(panel.status),
-            Print(format!(
-                "    threads: {}  depth: {}  queue×{}",
-                panel.threads, panel.parallel_depth, panel.permit_factor
-            )),
+            Print(format!("    threads: {}", panel.threads)),
             Print("\r\n")
         )?;
         render_progress(stdout, panel.progress)?;
@@ -996,19 +924,16 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "{}×{}  target: {}  nodes: {}  threads: {}  depth: {}  queue×{}  cache: {}\r\n",
+            "{}×{}  target: {}  nodes: {}  threads: {}  cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
             editor.maze.alive_count(),
             editor.solver_threads,
-            editor.solver_parallel_depth,
-            editor.solver_permit_factor,
             editor.evaluator.cache_len()
         )),
         Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
-        Print("S save cache · L load cache · [/] threads · d/D depth · f/F queue multiplier\r\n"),
-        Print("+/- rows · </> cols\r\n"),
+        Print("S save cache · L load cache · [/] threads · +/- rows · </> cols\r\n"),
         Print("r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 
@@ -1087,6 +1012,10 @@ fn render_editor(
 fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()> {
     let progress = view.progress;
     let stats = progress.stats;
+    let busy = stats.processing_hits.max(1) as f64;
+    let deferral_rate = stats.group_deferrals as f64 * 100.0 / busy;
+    let forced_rate = stats.forced_duplicate_evaluations as f64 * 100.0 / busy;
+    let resolved_rate = stats.deferred_resolved as f64 * 100.0 / busy;
     let estimated_bytes = if progress.estimated_cache_bytes == 0 && view.profile_age.is_none() {
         "~n/a".to_owned()
     } else if let Some(age) = view.profile_age {
@@ -1111,12 +1040,21 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             estimated_bytes
         )),
         Print(format!(
-            "busy {}  deferred {}  forced {}  symmetry {}  parallel {}\r\n",
+            "busy {}  resolved {} ({:.1}%)  forced {} ({:.1}%)  symmetry {}\r\n",
             stats.processing_hits,
             stats.deferred_resolved,
+            resolved_rate,
             stats.forced_duplicate_evaluations,
-            stats.symmetry_zero_certificates,
-            stats.parallel_expansions
+            forced_rate,
+            stats.symmetry_zero_certificates
+        )),
+        Print(format!(
+            "coop regions {}  group pulls {}  deferrals {} ({:.1}% of busy)  revisits {}\r\n",
+            stats.cooperative_regions,
+            stats.cooperative_group_pulls,
+            stats.group_deferrals,
+            deferral_rate,
+            stats.group_revisits
         )),
         Print(format!(
             "{:.0} eval/s  {:.0} unique/s  {:.0} hit/s  uptime {:.2?}\r\n",

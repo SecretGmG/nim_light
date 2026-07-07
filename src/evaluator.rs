@@ -13,11 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rayon::{
-    ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder,
-    iter::{ParallelBridge, ParallelIterator},
-    prelude::IntoParallelIterator,
-};
+use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 
 use crate::{
     board::BitMatrix,
@@ -26,8 +22,6 @@ use crate::{
     symmetry::InvolutionSymmetryFinder,
 };
 
-pub const DEFAULT_PARALLEL_DEPTH: usize = 2;
-pub const DEFAULT_PERMIT_FACTOR: usize = 16;
 const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH01";
 
 /// A conservative zero certificate evaluated after a cache miss.
@@ -49,8 +43,6 @@ impl SymmetryFinder for NoSymmetryFinder {
 pub struct EvaluatorConfig {
     pub threads: Option<usize>,
     pub cache_shards: usize,
-    pub parallel_depth: usize,
-    pub parallel_move_threshold: usize,
     pub max_cache_entries: Option<usize>,
     pub cache_low_watermark: f64,
 }
@@ -60,8 +52,6 @@ impl Default for EvaluatorConfig {
         Self {
             threads: Some(6),
             cache_shards: 64,
-            parallel_depth: 2,
-            parallel_move_threshold: 32,
             max_cache_entries: None,
             cache_low_watermark: 0.95,
         }
@@ -88,8 +78,14 @@ pub struct EvaluatorStats {
     pub forced_duplicate_evaluations: usize,
     /// Evaluation attempts terminated by a symmetry zero certificate.
     pub symmetry_zero_certificates: usize,
-    /// Position evaluations that selected a parallel expansion path.
-    pub parallel_expansions: usize,
+    /// Cooperative root/component fanout regions opened.
+    pub cooperative_regions: usize,
+    /// Successor groups pulled by cooperative workers.
+    pub cooperative_group_pulls: usize,
+    /// Successor groups deferred because a busy successor was encountered.
+    pub group_deferrals: usize,
+    /// Deferred successor groups revisited after fresh groups were exhausted.
+    pub group_revisits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -116,7 +112,10 @@ struct AtomicEvaluatorStats {
     deferred_resolved: AtomicUsize,
     forced_duplicate_evaluations: AtomicUsize,
     symmetry_zero_certificates: AtomicUsize,
-    parallel_expansions: AtomicUsize,
+    cooperative_regions: AtomicUsize,
+    cooperative_group_pulls: AtomicUsize,
+    group_deferrals: AtomicUsize,
+    group_revisits: AtomicUsize,
 }
 
 impl AtomicEvaluatorStats {
@@ -131,7 +130,10 @@ impl AtomicEvaluatorStats {
             deferred_resolved: self.deferred_resolved.load(Ordering::Relaxed),
             forced_duplicate_evaluations: self.forced_duplicate_evaluations.load(Ordering::Relaxed),
             symmetry_zero_certificates: self.symmetry_zero_certificates.load(Ordering::Relaxed),
-            parallel_expansions: self.parallel_expansions.load(Ordering::Relaxed),
+            cooperative_regions: self.cooperative_regions.load(Ordering::Relaxed),
+            cooperative_group_pulls: self.cooperative_group_pulls.load(Ordering::Relaxed),
+            group_deferrals: self.group_deferrals.load(Ordering::Relaxed),
+            group_revisits: self.group_revisits.load(Ordering::Relaxed),
         }
     }
 }
@@ -553,19 +555,6 @@ where
         self.nimber_of_canonical(&game)
     }
 
-    pub fn nimber_with_parallel_params(
-        &self,
-        matrix: &BitMatrix,
-        max_depth: usize,
-        permit_factor: usize,
-    ) -> usize {
-        if max_depth == DEFAULT_PARALLEL_DEPTH && permit_factor == DEFAULT_PERMIT_FACTOR {
-            return self.nimber(matrix);
-        }
-        let game = self.generator.canonicalize(matrix.clone());
-        self.nimber_of_canonical_with_parallel_params(&game, max_depth, permit_factor)
-    }
-
     pub fn nimber_cancellable(
         &self,
         matrix: &BitMatrix,
@@ -585,18 +574,6 @@ where
             .expect("uncancellable evaluation must not be cancelled")
     }
 
-    pub fn nimber_of_canonical_with_parallel_params(
-        &self,
-        game: &CanonicalGame,
-        max_depth: usize,
-        permit_factor: usize,
-    ) -> usize {
-        let permits = self.parallel_permits(permit_factor);
-        self.pool
-            .install(|| self.nimber_grouped_permit_inner(game, max_depth, &permits, None))
-            .expect("uncancellable evaluation must not be cancelled")
-    }
-
     pub fn nimber_of_canonical_cancellable(
         &self,
         game: &CanonicalGame,
@@ -605,46 +582,6 @@ where
         let nimber = self
             .pool
             .install(|| self.nimber_cooperative_root_inner(game, Some(cancel.as_ref())));
-        if nimber.is_none() {
-            self.cache.clear_processing();
-        }
-        nimber
-    }
-
-    pub fn nimber_cancellable_with_parallel_params(
-        &self,
-        matrix: &BitMatrix,
-        max_depth: usize,
-        permit_factor: usize,
-        cancel: &Arc<AtomicBool>,
-    ) -> Option<usize> {
-        if max_depth == DEFAULT_PARALLEL_DEPTH && permit_factor == DEFAULT_PERMIT_FACTOR {
-            return self.nimber_cancellable(matrix, cancel);
-        }
-        let game = self.generator.canonicalize(matrix.clone());
-        let nimber = self.nimber_of_canonical_cancellable_with_parallel_params(
-            &game,
-            max_depth,
-            permit_factor,
-            cancel,
-        );
-        if nimber.is_none() {
-            self.cache.clear_processing();
-        }
-        nimber
-    }
-
-    pub fn nimber_of_canonical_cancellable_with_parallel_params(
-        &self,
-        game: &CanonicalGame,
-        max_depth: usize,
-        permit_factor: usize,
-        cancel: &Arc<AtomicBool>,
-    ) -> Option<usize> {
-        let permits = self.parallel_permits(permit_factor);
-        let nimber = self.pool.install(|| {
-            self.nimber_grouped_permit_inner(game, max_depth, &permits, Some(cancel.as_ref()))
-        });
         if nimber.is_none() {
             self.cache.clear_processing();
         }
@@ -741,25 +678,11 @@ where
         )
     }
 
-    fn parallel_permits(&self, permit_factor: usize) -> ParallelPermits {
-        ParallelPermits::new(
-            self.pool
-                .current_num_threads()
-                .saturating_mul(permit_factor)
-                .max(1),
-        )
-    }
-
-    fn nimber_inner(
-        &self,
-        game: &CanonicalGame,
-        parallel_depth: usize,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
+    fn nimber_inner(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
-        match self.try_nimber(game, parallel_depth, cancel)? {
+        match self.try_nimber(game, cancel)? {
             Evaluation::Ready(nimber) => nimber,
             Evaluation::Busy => {
                 if let Some(nimber) = self.cache.get_done(game) {
@@ -768,34 +691,10 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     return Some(nimber);
                 }
-                self.evaluate_duplicate(game, parallel_depth, cancel)?
+                self.evaluate_duplicate(game, cancel)?
             }
         }
         .into()
-    }
-
-    fn nimber_grouped_permit_inner(
-        &self,
-        game: &CanonicalGame,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
-        if is_cancelled(cancel) {
-            return None;
-        }
-        match self.try_nimber_grouped_permit(game, depth_remaining, permits, cancel)? {
-            Evaluation::Ready(nimber) => Some(nimber),
-            Evaluation::Busy => {
-                if let Some(nimber) = self.cache.get_done(game) {
-                    self.stats
-                        .completed_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Some(nimber);
-                }
-                self.evaluate_duplicate(game, self.config.parallel_depth, cancel)
-            }
-        }
     }
 
     fn nimber_cooperative_root_inner(
@@ -825,7 +724,7 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     nimber
                 } else {
-                    self.evaluate_duplicate(game, self.config.parallel_depth, cancel)?
+                    self.evaluate_duplicate(game, cancel)?
                 }
             }
             CacheProbe::Claimed => {
@@ -842,12 +741,7 @@ where
         })
     }
 
-    fn try_nimber(
-        &self,
-        game: &CanonicalGame,
-        parallel_depth: usize,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<Evaluation> {
+    fn try_nimber(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<Evaluation> {
         if is_cancelled(cancel) {
             return None;
         }
@@ -873,94 +767,21 @@ where
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
-                let nimber = self.compute_position(game, parallel_depth, cancel)?;
+                let nimber = self.compute_position(game, cancel)?;
                 self.cache_result(game.clone(), nimber);
                 Evaluation::Ready(nimber)
             }
         })
     }
 
-    fn try_nimber_grouped_permit(
-        &self,
-        game: &CanonicalGame,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<Evaluation> {
-        if is_cancelled(cancel) {
-            return None;
-        }
-        if depth_remaining == 0 {
-            return self.try_nimber(game, self.config.parallel_depth, cancel);
-        }
-        if game.is_empty() {
-            return Some(Evaluation::Ready(0));
-        }
-
-        Some(match self.cache.probe(game) {
-            CacheProbe::Done(nimber) => {
-                self.stats
-                    .completed_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                Evaluation::Ready(nimber)
-            }
-            CacheProbe::Busy => {
-                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
-                Evaluation::Busy
-            }
-            CacheProbe::Claimed => {
-                self.stats
-                    .unique_positions_claimed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .evaluation_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-                let nimber =
-                    self.compute_position_grouped_permit(game, depth_remaining, permits, cancel)?;
-                self.cache_result(game.clone(), nimber);
-                Evaluation::Ready(nimber)
-            }
-        })
-    }
-
-    fn compute_position(
-        &self,
-        game: &CanonicalGame,
-        parallel_depth: usize,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
+    fn compute_position(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
         if game.components().len() > 1 {
-            self.nimber_of_components(game, parallel_depth, cancel)
+            self.nimber_of_components(game, cancel)
         } else {
-            self.nimber_of_component(&game.components()[0], parallel_depth, cancel)
-        }
-    }
-
-    fn compute_position_grouped_permit(
-        &self,
-        game: &CanonicalGame,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
-        if is_cancelled(cancel) {
-            return None;
-        }
-        if depth_remaining == 0 {
-            return self.compute_position(game, self.config.parallel_depth, cancel);
-        }
-        if game.components().len() > 1 {
-            self.nimber_of_components_grouped_permit(game, depth_remaining, permits, cancel)
-        } else {
-            self.nimber_of_component_grouped_permit(
-                &game.components()[0],
-                depth_remaining,
-                permits,
-                cancel,
-            )
+            self.nimber_of_component(&game.components()[0], cancel)
         }
     }
 
@@ -973,7 +794,7 @@ where
             return None;
         }
         if game.components().len() > 1 {
-            return self.nimber_of_components(game, self.config.parallel_depth, cancel);
+            return self.nimber_of_components(game, cancel);
         }
         self.nimber_of_component_cooperative_root(&game.components()[0], cancel)
     }
@@ -981,7 +802,6 @@ where
     fn evaluate_duplicate(
         &self,
         game: &CanonicalGame,
-        parallel_depth: usize,
         cancel: Option<&AtomicBool>,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
@@ -993,7 +813,7 @@ where
         self.stats
             .evaluation_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let nimber = self.compute_position(game, parallel_depth, cancel)?;
+        let nimber = self.compute_position(game, cancel)?;
         self.cache_result(game.clone(), nimber);
         Some(nimber)
     }
@@ -1001,31 +821,18 @@ where
     fn nimber_of_components(
         &self,
         game: &CanonicalGame,
-        parallel_depth: usize,
         cancel: Option<&AtomicBool>,
     ) -> Option<usize> {
-        if parallel_depth > 0 {
-            self.stats
-                .parallel_expansions
-                .fetch_add(1, Ordering::Relaxed);
-            let nimbers: Option<Vec<_>> = (0..game.components().len())
-                .into_par_iter()
-                .map(|index| self.nimber_inner(&game.component(index), parallel_depth - 1, cancel))
-                .collect();
-            nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
-        } else {
-            let mut nimber = 0;
-            for index in 0..game.components().len() {
-                nimber ^= self.nimber_inner(&game.component(index), 0, cancel)?;
-            }
-            Some(nimber)
+        let mut nimber = 0;
+        for index in 0..game.components().len() {
+            nimber ^= self.nimber_inner(&game.component(index), cancel)?;
         }
+        Some(nimber)
     }
 
     fn nimber_of_component(
         &self,
         component: &BitMatrix,
-        parallel_depth: usize,
         cancel: Option<&AtomicBool>,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
@@ -1039,64 +846,16 @@ where
         }
 
         let bound = component.count_ones() + 1;
-        let estimated_moves = self.generator.estimated_successors(component);
-        let reachable =
-            if parallel_depth > 0 && estimated_moves >= self.config.parallel_move_threshold {
-                self.stats
-                    .parallel_expansions
-                    .fetch_add(1, Ordering::Relaxed);
-                let worker = self
-                    .generator
-                    .successors(component)
-                    .par_bridge()
-                    .fold(
-                        || WorkerResult::new(bound),
-                        |mut worker, successor| {
-                            if is_cancelled(cancel) {
-                                worker.cancelled = true;
-                            } else {
-                                worker.push(
-                                    self.try_nimber(&successor, parallel_depth - 1, cancel),
-                                    successor,
-                                );
-                            }
-                            worker
-                        },
-                    )
-                    .map(|mut worker| {
-                        self.resolve_pending(&mut worker, parallel_depth - 1, cancel);
-                        worker
-                    })
-                    .reduce(
-                        || WorkerResult::new(bound),
-                        |mut left, right| {
-                            left.cancelled |= right.cancelled;
-                            left.reachable.union_with(&right.reachable);
-                            left
-                        },
-                    );
-                if worker.cancelled {
-                    return None;
-                }
-                worker.reachable
-            } else {
-                let mut worker = WorkerResult::new(bound);
-                for successor in self.generator.successors(component) {
-                    if is_cancelled(cancel) {
-                        return None;
-                    }
-                    match self.try_nimber(&successor, parallel_depth, cancel)? {
-                        Evaluation::Ready(nimber) => worker.reachable.insert(nimber),
-                        Evaluation::Busy => worker.pending.push(successor),
-                    }
-                }
-                self.resolve_pending(&mut worker, parallel_depth, cancel);
-                if worker.cancelled {
-                    return None;
-                }
-                worker.reachable
-            };
-        Some(reachable.mex())
+        let mut worker = WorkerResult::new(bound);
+        self.evaluate_successor_groups(
+            self.generator.successor_groups(component),
+            &mut worker,
+            cancel,
+        );
+        if worker.cancelled {
+            return None;
+        }
+        Some(worker.reachable.mex())
     }
 
     fn nimber_of_component_cooperative_root(
@@ -1124,7 +883,7 @@ where
         let worker_count = self.pool.current_num_threads().max(1);
 
         self.stats
-            .parallel_expansions
+            .cooperative_regions
             .fetch_add(1, Ordering::Relaxed);
 
         rayon::scope(|scope| {
@@ -1139,6 +898,9 @@ where
                         let Some(group) = groups.lock().expect("root groups poisoned").pop() else {
                             break;
                         };
+                        self.stats
+                            .cooperative_group_pulls
+                            .fetch_add(1, Ordering::Relaxed);
                         let mut deferred = Vec::new();
                         self.evaluate_successor_group_vec_with_deferral(
                             group.into_iter().collect(),
@@ -1148,6 +910,7 @@ where
                             cancel,
                         );
                         for deferred_group in deferred {
+                            self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
                             self.evaluate_successor_group_vec_with_deferral(
                                 deferred_group,
                                 &mut local,
@@ -1173,167 +936,14 @@ where
         });
 
         let mut result = result.into_inner().expect("root result poisoned");
-        self.resolve_pending(&mut result, self.config.parallel_depth, cancel);
+        self.resolve_pending(&mut result, cancel);
         if result.cancelled {
             return None;
         }
         Some(result.reachable.mex())
     }
 
-    fn nimber_of_components_grouped_permit(
-        &self,
-        game: &CanonicalGame,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
-        let component_count = game.components().len();
-        let parallel_count = permits.acquire_up_to(component_count);
-        if parallel_count == 0 {
-            let mut nimber = 0;
-            for index in 0..component_count {
-                nimber ^=
-                    self.nimber_inner(&game.component(index), self.config.parallel_depth, cancel)?;
-            }
-            return Some(nimber);
-        }
-
-        self.stats
-            .parallel_expansions
-            .fetch_add(1, Ordering::Relaxed);
-        let (parallel, local) = rayon::join(
-            || {
-                let nimbers: Option<Vec<_>> = (0..parallel_count)
-                    .into_par_iter()
-                    .map(|index| {
-                        self.nimber_grouped_permit_inner(
-                            &game.component(index),
-                            depth_remaining - 1,
-                            permits,
-                            cancel,
-                        )
-                    })
-                    .collect();
-                permits.release(parallel_count);
-                nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
-            },
-            || {
-                let mut nimber = 0;
-                for index in parallel_count..component_count {
-                    nimber ^= self.nimber_inner(
-                        &game.component(index),
-                        self.config.parallel_depth,
-                        cancel,
-                    )?;
-                }
-                Some(nimber)
-            },
-        );
-        Some(parallel? ^ local?)
-    }
-
-    fn nimber_of_component_grouped_permit(
-        &self,
-        component: &BitMatrix,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) -> Option<usize> {
-        if is_cancelled(cancel) {
-            return None;
-        }
-        if depth_remaining == 0 {
-            return self.nimber_of_component(component, self.config.parallel_depth, cancel);
-        }
-        if self.symmetry_finder.proves_zero(component) {
-            self.stats
-                .symmetry_zero_certificates
-                .fetch_add(1, Ordering::Relaxed);
-            return Some(0);
-        }
-
-        let bound = component.count_ones() + 1;
-        let mut groups: Vec<_> = self.generator.successor_groups(component).collect();
-        let parallel_count = permits.acquire_up_to(groups.len());
-        let local_groups = groups.split_off(parallel_count);
-
-        if parallel_count == 0 {
-            let mut worker = WorkerResult::new(bound);
-            self.evaluate_successor_groups_dfs(local_groups, &mut worker, cancel);
-            if worker.cancelled {
-                return None;
-            }
-            return Some(worker.reachable.mex());
-        }
-
-        self.stats
-            .parallel_expansions
-            .fetch_add(1, Ordering::Relaxed);
-        let (parallel_worker, local_worker) = rayon::join(
-            || {
-                let worker = groups
-                    .into_par_iter()
-                    .fold(
-                        || WorkerResult::new(bound),
-                        |mut worker, group| {
-                            let mut deferred = Vec::new();
-                            self.evaluate_successor_group_with_permit_deferral(
-                                group,
-                                &mut worker,
-                                &mut deferred,
-                                depth_remaining - 1,
-                                permits,
-                                cancel,
-                            );
-                            for deferred_group in deferred {
-                                self.evaluate_successor_group_vec_with_permit_deferral(
-                                    deferred_group,
-                                    &mut worker,
-                                    &mut Vec::new(),
-                                    depth_remaining - 1,
-                                    permits,
-                                    DeferMode::Revisit,
-                                    cancel,
-                                );
-                                if worker.cancelled {
-                                    break;
-                                }
-                            }
-                            worker
-                        },
-                    )
-                    .map(|mut worker| {
-                        self.resolve_pending(&mut worker, self.config.parallel_depth, cancel);
-                        worker
-                    })
-                    .reduce(
-                        || WorkerResult::new(bound),
-                        |mut left, right| {
-                            left.cancelled |= right.cancelled;
-                            left.reachable.union_with(&right.reachable);
-                            left
-                        },
-                    );
-                permits.release(parallel_count);
-                worker
-            },
-            || {
-                let mut worker = WorkerResult::new(bound);
-                self.evaluate_successor_groups_dfs(local_groups, &mut worker, cancel);
-                worker
-            },
-        );
-
-        let mut worker = parallel_worker;
-        worker.cancelled |= local_worker.cancelled;
-        worker.reachable.union_with(&local_worker.reachable);
-        if worker.cancelled {
-            return None;
-        }
-        Some(worker.reachable.mex())
-    }
-
-    fn evaluate_successor_groups_dfs<I, H>(
+    fn evaluate_successor_groups<I, H>(
         &self,
         groups: I,
         worker: &mut WorkerResult,
@@ -1356,6 +966,7 @@ where
             }
         }
         for group in deferred {
+            self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
             self.evaluate_successor_group_vec_with_deferral(
                 group,
                 worker,
@@ -1367,7 +978,7 @@ where
                 return;
             }
         }
-        self.resolve_pending(worker, self.config.parallel_depth, cancel);
+        self.resolve_pending(worker, cancel);
     }
 
     fn evaluate_successor_group_vec_with_deferral(
@@ -1383,10 +994,11 @@ where
                 worker.cancelled = true;
                 return;
             }
-            match self.try_nimber(successor, self.config.parallel_depth, cancel) {
+            match self.try_nimber(successor, cancel) {
                 Some(Evaluation::Ready(nimber)) => worker.reachable.insert(nimber),
                 Some(Evaluation::Busy) => {
                     if mode == DeferMode::Fresh {
+                        self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
                         deferred.push(successors[index..].to_vec());
                         return;
                     } else {
@@ -1401,68 +1013,7 @@ where
         }
     }
 
-    fn evaluate_successor_group_with_permit_deferral<H>(
-        &self,
-        group: H,
-        worker: &mut WorkerResult,
-        deferred: &mut Vec<Vec<CanonicalGame>>,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        cancel: Option<&AtomicBool>,
-    ) where
-        H: IntoIterator<Item = CanonicalGame>,
-    {
-        self.evaluate_successor_group_vec_with_permit_deferral(
-            group.into_iter().collect(),
-            worker,
-            deferred,
-            depth_remaining,
-            permits,
-            DeferMode::Fresh,
-            cancel,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_successor_group_vec_with_permit_deferral(
-        &self,
-        successors: Vec<CanonicalGame>,
-        worker: &mut WorkerResult,
-        deferred: &mut Vec<Vec<CanonicalGame>>,
-        depth_remaining: usize,
-        permits: &ParallelPermits,
-        mode: DeferMode,
-        cancel: Option<&AtomicBool>,
-    ) {
-        for (index, successor) in successors.iter().enumerate() {
-            if is_cancelled(cancel) {
-                worker.cancelled = true;
-                return;
-            }
-            match self.try_nimber_grouped_permit(successor, depth_remaining, permits, cancel) {
-                Some(Evaluation::Ready(nimber)) => worker.reachable.insert(nimber),
-                Some(Evaluation::Busy) => {
-                    if mode == DeferMode::Fresh {
-                        deferred.push(successors[index..].to_vec());
-                        return;
-                    } else {
-                        worker.pending.push(successor.clone());
-                    }
-                }
-                None => {
-                    worker.cancelled = true;
-                    return;
-                }
-            }
-        }
-    }
-
-    fn resolve_pending(
-        &self,
-        worker: &mut WorkerResult,
-        parallel_depth: usize,
-        cancel: Option<&AtomicBool>,
-    ) {
+    fn resolve_pending(&self, worker: &mut WorkerResult, cancel: Option<&AtomicBool>) {
         for game in worker.pending.drain(..) {
             if is_cancelled(cancel) {
                 worker.cancelled = true;
@@ -1475,7 +1026,7 @@ where
                 self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
                 nimber
             } else {
-                let Some(nimber) = self.evaluate_duplicate(&game, parallel_depth, cancel) else {
+                let Some(nimber) = self.evaluate_duplicate(&game, cancel) else {
                     worker.cancelled = true;
                     return;
                 };
@@ -1528,49 +1079,6 @@ impl WorkerResult {
             pending: Vec::new(),
             cancelled: false,
         }
-    }
-
-    fn push(&mut self, evaluation: Option<Evaluation>, game: CanonicalGame) {
-        match evaluation {
-            Some(Evaluation::Ready(nimber)) => self.reachable.insert(nimber),
-            Some(Evaluation::Busy) => self.pending.push(game),
-            None => self.cancelled = true,
-        }
-    }
-}
-
-struct ParallelPermits {
-    available: AtomicUsize,
-}
-
-impl ParallelPermits {
-    fn new(permits: usize) -> Self {
-        Self {
-            available: AtomicUsize::new(permits),
-        }
-    }
-
-    fn acquire_up_to(&self, requested: usize) -> usize {
-        let mut current = self.available.load(Ordering::Relaxed);
-        loop {
-            if current == 0 || requested == 0 {
-                return 0;
-            }
-            let acquired = requested.min(current);
-            match self.available.compare_exchange_weak(
-                current,
-                current - acquired,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return acquired,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn release(&self, permits: usize) {
-        self.available.fetch_add(permits, Ordering::Release);
     }
 }
 
@@ -1794,7 +1302,6 @@ mod tests {
             InvolutionSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(8),
-                parallel_move_threshold: 32,
                 ..EvaluatorConfig::default()
             },
         )
@@ -1977,12 +1484,11 @@ mod tests {
     #[test]
     fn parallel_and_sequential_evaluators_agree() {
         let matrix = heap(6);
-        let sequential = Evaluator::with_config(
+        let single_threaded = Evaluator::with_config(
             CanonicalMoveGenerator::new(PseudoCanonicalizer),
             NoSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(1),
-                parallel_depth: 0,
                 ..EvaluatorConfig::default()
             },
         )
@@ -1992,38 +1498,36 @@ mod tests {
             NoSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(4),
-                parallel_depth: 2,
-                parallel_move_threshold: 2,
                 ..EvaluatorConfig::default()
             },
         )
         .unwrap();
 
-        assert_eq!(parallel.nimber(&matrix), sequential.nimber(&matrix));
-        assert!(parallel.stats().parallel_expansions > 0);
+        assert_eq!(parallel.nimber(&matrix), single_threaded.nimber(&matrix));
+        assert!(parallel.stats().cooperative_regions > 0);
     }
 
     #[test]
-    fn default_parallel_evaluator_agrees_with_dfs_fallback() {
+    fn cooperative_evaluator_is_thread_count_independent() {
         for matrix in [
             heap(6),
             dense_rectangle(3, 4),
             dense_rectangle(2, 5),
             spiral_maze_game(3, 3),
         ] {
-            let fallback = DfsSolver::default();
-            let expected = fallback.nimber_with_parallel_params(&matrix, 0, DEFAULT_PERMIT_FACTOR);
+            let single_threaded = Evaluator::with_config(
+                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                InvolutionSymmetryFinder,
+                EvaluatorConfig {
+                    threads: Some(1),
+                    ..EvaluatorConfig::default()
+                },
+            )
+            .unwrap();
+            let parallel = DfsSolver::default();
 
-            let default = DfsSolver::default();
-            assert_eq!(default.nimber(&matrix), expected);
-            assert!(default.stats().parallel_expansions > 0);
-
-            let depth_three = DfsSolver::default();
-            assert_eq!(
-                depth_three.nimber_with_parallel_params(&matrix, 3, DEFAULT_PERMIT_FACTOR),
-                expected
-            );
-            assert!(depth_three.stats().parallel_expansions > 0);
+            assert_eq!(parallel.nimber(&matrix), single_threaded.nimber(&matrix));
+            assert!(parallel.stats().cooperative_regions > 0);
         }
     }
 

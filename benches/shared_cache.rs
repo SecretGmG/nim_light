@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    env,
     hint::black_box,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -25,7 +24,6 @@ fn shared_cache_suite(c: &mut Criterion) {
                 InvolutionSymmetryFinder,
                 EvaluatorConfig {
                     threads: Some(8),
-                    parallel_move_threshold: 32,
                     ..EvaluatorConfig::default()
                 },
             )
@@ -139,41 +137,6 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
     }
 }
 
-fn permit_parallel_ab(c: &mut Criterion) {
-    let threads = bench_threads();
-    for (label, game) in labelled_benchmark_games() {
-        c.bench_function(
-            &format!("permit_parallel/{threads}_threads/depth_0_dfs_fallback/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_with_parallel_params(&game, 0, 16));
-                });
-            },
-        );
-
-        c.bench_function(
-            &format!("permit_parallel/{threads}_threads/depth_2_default/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber(&game));
-                });
-            },
-        );
-
-        c.bench_function(
-            &format!("permit_parallel/{threads}_threads/depth_3/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_with_parallel_params(&game, 3, 16));
-                });
-            },
-        );
-    }
-}
-
 fn new_evaluator() -> DfsSolver {
     new_evaluator_with_threads(8)
 }
@@ -185,19 +148,10 @@ fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
         EvaluatorConfig {
             threads: Some(threads),
             cache_shards: cache_shards_for_threads(threads),
-            parallel_move_threshold: 32,
             ..EvaluatorConfig::default()
         },
     )
     .unwrap()
-}
-
-fn bench_threads() -> usize {
-    env::var("NIM_LIGHT_BENCH_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&threads| threads > 0)
-        .unwrap_or(8)
 }
 
 fn cache_shards_for_threads(threads: usize) -> usize {
@@ -430,6 +384,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(30));
-    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, permit_parallel_ab
+    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move
 }
 criterion_main!(benches);

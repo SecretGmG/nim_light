@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     board::{Axis, Cell, Maze, MoveError},
-    evaluator::{DEFAULT_PARALLEL_DEPTH, DEFAULT_PERMIT_FACTOR, DfsSolver},
+    evaluator::DfsSolver,
     solver::compile_maze,
 };
 
@@ -124,21 +124,6 @@ pub enum SolverMoveResult {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SolverSearchConfig {
-    pub parallel_depth: usize,
-    pub permit_factor: usize,
-}
-
-impl Default for SolverSearchConfig {
-    fn default() -> Self {
-        Self {
-            parallel_depth: DEFAULT_PARALLEL_DEPTH,
-            permit_factor: DEFAULT_PERMIT_FACTOR,
-        }
-    }
-}
-
 pub fn solver_move(maze: &Maze, solver: &DfsSolver) -> Option<Move> {
     let cancel = Arc::new(AtomicBool::new(false));
     match solver_move_cancellable(maze, solver, &cancel) {
@@ -150,15 +135,6 @@ pub fn solver_move(maze: &Maze, solver: &DfsSolver) -> Option<Move> {
 pub fn solver_move_cancellable(
     maze: &Maze,
     solver: &DfsSolver,
-    cancel: &Arc<AtomicBool>,
-) -> SolverMoveResult {
-    solver_move_cancellable_with_config(maze, solver, SolverSearchConfig::default(), cancel)
-}
-
-pub fn solver_move_cancellable_with_config(
-    maze: &Maze,
-    solver: &DfsSolver,
-    config: SolverSearchConfig,
     cancel: &Arc<AtomicBool>,
 ) -> SolverMoveResult {
     let corridors = alive_corridors(maze);
@@ -184,7 +160,6 @@ pub fn solver_move_cancellable_with_config(
             let mut search = SolverSearch {
                 maze,
                 solver,
-                config,
                 corridor,
                 cancel,
                 fallback: &mut fallback,
@@ -231,7 +206,6 @@ fn alive_corridors(maze: &Maze) -> Vec<Corridor> {
 struct SolverSearch<'a> {
     maze: &'a Maze,
     solver: &'a DfsSolver,
-    config: SolverSearchConfig,
     corridor: &'a Corridor,
     cancel: &'a Arc<AtomicBool>,
     fallback: &'a mut Option<Move>,
@@ -259,12 +233,10 @@ impl SolverSearch<'_> {
             let mut next = self.maze.clone();
             next.apply_move(movement.axis, movement.anchor, &movement.cells)
                 .expect("generated solver moves must be legal");
-            return match self.solver.nimber_cancellable_with_parallel_params(
-                &compile_maze(&next),
-                self.config.parallel_depth,
-                self.config.permit_factor,
-                self.cancel,
-            ) {
+            return match self
+                .solver
+                .nimber_cancellable(&compile_maze(&next), self.cancel)
+            {
                 Some(0) => SolverMoveResult::Move(movement),
                 Some(_) => SolverMoveResult::NoMove,
                 None => SolverMoveResult::Cancelled,

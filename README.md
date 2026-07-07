@@ -45,8 +45,6 @@ c               clear cache
 S               save completed cache entries to nim_light.cache
 L               load completed cache entries from nim_light.cache
 [ / ]           decrease / increase solver threads without clearing cache
-d / D           decrease / increase parallel depth
-f / F           decrease / increase task queue multiplier
 + / -           resize rows
 < / >           resize columns
 r               reset to demo board
@@ -59,10 +57,6 @@ Thread changes preserve completed cache entries and rebuild the evaluator with
 a cache shard count appropriate for the new thread count. In-flight
 `Processing` sentinels are not preserved because they are only meaningful
 during one active computation.
-
-The parallel depth and queue multiplier affect both editor nimber computation
-and solver CPU move search. The default settings are depth `2` and queue
-multiplier `16`.
 
 ## Solver notes
 
@@ -81,9 +75,8 @@ use shared `Processing` cache entries to avoid piling onto already-owned work.
 Within grouped evaluation, a busy successor defers the rest of that group on
 the first pass; deferred groups are revisited after fresh groups are exhausted.
 
-The parameterized scheduler still supports grouped permit parallelism with
-depth 2 and queue multiplier 16 as the default settings. The plain DFS path
-remains as an internal fallback and benchmark comparison.
+This cooperative scheduler is the only evaluator scheduler. The only exposed
+concurrency setting is the number of solver threads.
 
 ## Reference result
 
@@ -106,14 +99,8 @@ parallel scheduling without needing a more complicated benchmark harness.
 
 Criterion benchmarks live in `benches/shared_cache.rs`.
 
-Run the permit scheduler benchmarks on a large machine with:
+Run the benchmark suite with:
 
 ```bash
-NIM_LIGHT_BENCH_THREADS=128 cargo bench --bench shared_cache -- permit_parallel
+cargo bench --bench shared_cache
 ```
-
-The benchmark includes:
-
-- `depth_0_dfs_fallback`
-- `depth_2_default`
-- `depth_3`
