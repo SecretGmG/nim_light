@@ -105,6 +105,30 @@ impl Selection {
         }
     }
 
+    fn alive_corridor(&self, maze: &Maze) -> Vec<Cell> {
+        self.corridor(maze)
+            .into_iter()
+            .filter(|&cell| maze.is_alive(cell))
+            .collect()
+    }
+
+    fn corridor_is_fully_selected(&self, maze: &Maze) -> bool {
+        let alive = self.alive_corridor(maze);
+        !alive.is_empty() && alive.iter().all(|cell| self.cells.contains(cell))
+    }
+
+    fn select_cell(&mut self, cell: Cell) {
+        if !self.cells.contains(&cell) {
+            self.cells.push(cell);
+        }
+    }
+
+    fn deselect_cell(&mut self, cell: Cell) {
+        if let Some(index) = self.cells.iter().position(|&selected| selected == cell) {
+            self.cells.swap_remove(index);
+        }
+    }
+
     fn take_move(&mut self) -> Option<Move> {
         if self.cells.is_empty() {
             return None;
@@ -116,6 +140,15 @@ impl Selection {
         })
     }
 }
+
+struct LastSpace {
+    at: Instant,
+    corridor: Vec<Cell>,
+    sweep_select: bool,
+}
+
+const DOUBLE_SPACE_WINDOW: Duration = Duration::from_millis(350);
+const SWEEP_FRAME: Duration = Duration::from_millis(28);
 
 pub fn run() -> io::Result<()> {
     let _terminal = TerminalGuard::enter()?;
@@ -168,10 +201,9 @@ fn menu(stdout: &mut impl Write) -> io::Result<Option<MenuChoice>> {
             SetForegroundColor(Color::Cyan),
             Print("NIM LIGHT\r\n\r\n"),
             ResetColor,
-            Print("Remove one or more nodes from a single corridor.\r\n"),
-            Print("The player taking the final node wins.\r\n\r\n"),
+            Print("Take one or more nodes from one corridor. Last move wins.\r\n\r\n"),
             Print("  1  Human vs human\r\n"),
-            Print("  2  Human vs solver CPU\r\n\r\n"),
+            Print("  2  Human vs solver CPU\r\n"),
             Print("  3  Level editor / solver\r\n\r\n"),
             Print("  q  Quit\r\n")
         )?;
@@ -455,6 +487,7 @@ fn play_game(
     solver_threads: usize,
 ) -> io::Result<PostGame> {
     let mut selection = Selection::new();
+    let mut last_space = None;
     let initial_maze = game.maze.clone();
     let shows_solver_panel = game
         .players
@@ -482,6 +515,7 @@ fn play_game(
                             Game::human_vs_human_on(initial_maze.clone())
                         };
                         selection = Selection::new();
+                        last_space = None;
                     }
                     KeyCode::Char('m') | KeyCode::Esc => return Ok(PostGame::Menu),
                     KeyCode::Char('q') => return Ok(PostGame::Quit),
@@ -510,19 +544,64 @@ fn play_game(
             && is_press(key)
         {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => selection.move_cursor(&game.maze, -1, 0),
-                KeyCode::Down | KeyCode::Char('j') => selection.move_cursor(&game.maze, 1, 0),
-                KeyCode::Left | KeyCode::Char('h') => selection.move_cursor(&game.maze, 0, -1),
-                KeyCode::Right | KeyCode::Char('l') => selection.move_cursor(&game.maze, 0, 1),
-                KeyCode::Tab => selection.toggle_axis(),
-                KeyCode::Char(' ') => selection.toggle_current(&game.maze),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selection.move_cursor(&game.maze, -1, 0);
+                    last_space = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selection.move_cursor(&game.maze, 1, 0);
+                    last_space = None;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    selection.move_cursor(&game.maze, 0, -1);
+                    last_space = None;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    selection.move_cursor(&game.maze, 0, 1);
+                    last_space = None;
+                }
+                KeyCode::Tab => {
+                    selection.toggle_axis();
+                    last_space = None;
+                }
+                KeyCode::Char(' ') => {
+                    let corridor = selection.corridor(&game.maze);
+                    let is_double_space = last_space.as_ref().is_some_and(|last: &LastSpace| {
+                        last.at.elapsed() <= DOUBLE_SPACE_WINDOW && last.corridor == corridor
+                    });
+                    if is_double_space {
+                        let panel = shows_solver_panel.then(|| SolverPanel {
+                            status: "Solver cache",
+                            progress: solver.progress(),
+                            threads: solver_threads,
+                        });
+                        let select = last_space
+                            .as_ref()
+                            .map(|last| last.sweep_select)
+                            .unwrap_or_else(|| !selection.corridor_is_fully_selected(&game.maze));
+                        animate_corridor_sweep(stdout, game, &mut selection, panel, select)?;
+                        last_space = None;
+                    } else {
+                        let sweep_select = !selection.corridor_is_fully_selected(&game.maze);
+                        selection.toggle_current(&game.maze);
+                        last_space = Some(LastSpace {
+                            at: Instant::now(),
+                            corridor,
+                            sweep_select,
+                        });
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(movement) = selection.take_move() {
                         game.play(movement)
                             .expect("the UI must only construct legal moves");
                     }
+                    last_space = None;
                 }
-                KeyCode::Esc => selection.cells.clear(),
+                KeyCode::Esc => {
+                    selection.cells.clear();
+                    last_space = None;
+                }
                 KeyCode::Char('m') => return Ok(PostGame::Menu),
                 KeyCode::Char('q') => return Ok(PostGame::Quit),
                 _ => {}
@@ -624,6 +703,30 @@ fn run_cpu_turn(
     }
 }
 
+fn animate_corridor_sweep(
+    stdout: &mut impl Write,
+    game: &Game,
+    selection: &mut Selection,
+    solver_panel: Option<SolverPanel>,
+    select: bool,
+) -> io::Result<()> {
+    let cells = selection.alive_corridor(&game.maze);
+    if cells.is_empty() {
+        return Ok(());
+    }
+
+    for cell in cells {
+        if select {
+            selection.select_cell(cell);
+        } else {
+            selection.deselect_cell(cell);
+        }
+        render(stdout, game, selection, solver_panel)?;
+        thread::sleep(SWEEP_FRAME);
+    }
+    Ok(())
+}
+
 fn is_press(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
@@ -656,12 +759,12 @@ fn render(
             Print(&game.current_player().name),
             ResetColor,
             Print(format!(
-                "    remaining: {}    corridor: {}\r\n",
+                "    nodes: {}    corridor: {}\r\n",
                 game.maze.alive_count(),
                 selection.axis.name()
             )),
-            Print("Arrows/hjkl: move   Tab: change corridor   Space: select   Enter: take\r\n"),
-            Print("Esc: clear selection   m: menu   q: quit\r\n\r\n")
+            Print("Move: arrows/hjkl  Axis: Tab  Select: Space  Sweep: Space×2  Take: Enter\r\n"),
+            Print("Esc clears selection  ·  m menu  ·  q quit\r\n\r\n")
         )?;
     }
 
@@ -714,7 +817,7 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "Size: {}×{}    Target: {}    remaining nodes: {}    threads: {}    cache: {}\r\n",
+            "{}×{}  target: {}  nodes: {}  threads: {}  cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
@@ -722,9 +825,8 @@ fn render_editor(
             editor.solver_threads,
             editor.evaluator.cache_len()
         )),
-        Print("Arrows/hjkl: move   Tab: target   Space: toggle   n: nimber\r\n"),
-        Print("+/-: rows   </>: cols   [/]: threads   c: clear cache\r\n"),
-        Print("r: demo board   o: open board   m/Esc: menu   q: quit\r\n\r\n")
+        Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c cache\r\n"),
+        Print("+/- rows · </> cols · [/] threads · r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 
     render_editor_maze(stdout, editor)?;
@@ -796,29 +898,25 @@ fn render_progress(stdout: &mut impl Write, progress: EvaluatorProgress) -> io::
     queue!(
         stdout,
         Print(format!(
-            "attempts: {}    unique: {}    completed: {}    cache hits: {}\r\n",
+            "evals {}  unique {}  done {}  hits {}  cache {}+{} (~{})\r\n",
             stats.evaluation_attempts,
             stats.unique_positions_claimed,
             stats.completed_positions,
-            stats.completed_cache_hits
-        )),
-        Print(format!(
-            "cache: {} done + {} processing = {} entries, ~{}\r\n",
+            stats.completed_cache_hits,
             progress.cache_done_entries,
             progress.cache_processing_entries,
-            progress.cache_entries,
             format_bytes(progress.estimated_cache_bytes)
         )),
         Print(format!(
-            "busy hits: {}    deferred: {}    forced duplicates: {}\r\n",
-            stats.processing_hits, stats.deferred_resolved, stats.forced_duplicate_evaluations
+            "busy {}  deferred {}  forced {}  symmetry {}  parallel {}\r\n",
+            stats.processing_hits,
+            stats.deferred_resolved,
+            stats.forced_duplicate_evaluations,
+            stats.symmetry_zero_certificates,
+            stats.parallel_expansions
         )),
         Print(format!(
-            "symmetry zeros: {}    parallel expansions: {}\r\n",
-            stats.symmetry_zero_certificates, stats.parallel_expansions
-        )),
-        Print(format!(
-            "rates: {:.0} eval/s    {:.0} unique/s    {:.0} cache hits/s    uptime: {:.2?}\r\n",
+            "{:.0} eval/s  {:.0} unique/s  {:.0} hit/s  uptime {:.2?}\r\n",
             progress.evaluations_per_second,
             progress.unique_positions_per_second,
             progress.cache_hits_per_second,
