@@ -26,6 +26,12 @@ pub struct CanonicalMoveGenerator<C> {
     canonicalizer: C,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedSuccessor {
+    pub removed_nodes: usize,
+    pub game: CanonicalGame,
+}
+
 impl<C> CanonicalMoveGenerator<C> {
     pub fn new(canonicalizer: C) -> Self {
         Self { canonicalizer }
@@ -33,6 +39,27 @@ impl<C> CanonicalMoveGenerator<C> {
 
     pub fn canonicalizer(&self) -> &C {
         &self.canonicalizer
+    }
+}
+
+impl<C> CanonicalMoveGenerator<C>
+where
+    C: Canonicalizer,
+{
+    pub fn ordered_successors(&self, component: &BitMatrix) -> Vec<OrderedSuccessor> {
+        let original_nodes = component.count_ones();
+        let mut raw_successors = CanonicalSuccessors::new(component, &self.canonicalizer);
+        let mut successors: Vec<_> = std::iter::from_fn(|| raw_successors.next_with_raw_count())
+            .filter_map(|successor| {
+                let removed_nodes = original_nodes.checked_sub(successor.raw_count_ones)?;
+                Some(OrderedSuccessor {
+                    removed_nodes,
+                    game: successor.game,
+                })
+            })
+            .collect();
+        successors.sort_by_key(|successor| std::cmp::Reverse(successor.removed_nodes));
+        successors
     }
 }
 
@@ -178,6 +205,26 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.next_raw()
             .map(|raw| self.canonicalizer.canonicalize(raw))
+    }
+}
+
+struct RawCanonicalSuccessor {
+    raw_count_ones: usize,
+    game: CanonicalGame,
+}
+
+impl<'a, C> CanonicalSuccessors<'a, C>
+where
+    C: Canonicalizer,
+{
+    fn next_with_raw_count(&mut self) -> Option<RawCanonicalSuccessor> {
+        self.next_raw().map(|raw| {
+            let raw_count_ones = raw.count_ones();
+            RawCanonicalSuccessor {
+                raw_count_ones,
+                game: self.canonicalizer.canonicalize(raw),
+            }
+        })
     }
 }
 

@@ -22,9 +22,11 @@ use crossterm::{
 
 use crate::{
     board::{Axis, Cell, Maze},
-    evaluator::{DfsSolver, EvaluatorStats},
-    game::{Game, Move, PlayerKind, solver_move},
-    solver::compile_maze,
+    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress},
+    game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
+    solver::{PseudoCanonicalizer, compile_maze},
+    successor::CanonicalMoveGenerator,
+    symmetry::InvolutionSymmetryFinder,
 };
 
 struct TerminalGuard;
@@ -118,23 +120,41 @@ impl Selection {
 pub fn run() -> io::Result<()> {
     let _terminal = TerminalGuard::enter()?;
     let mut stdout = io::stdout();
+    let mut editor = Editor::new();
 
     loop {
         let Some(choice) = menu(&mut stdout)? else {
             return Ok(());
         };
-        let mut game = match choice {
-            MenuChoice::HumanVsHuman => Game::human_vs_human(),
-            MenuChoice::HumanVsCpu => Game::human_vs_cpu(),
-            MenuChoice::Editor => match edit_board(&mut stdout)? {
+        match choice {
+            MenuChoice::HumanVsHuman => {
+                let mut game = Game::human_vs_human_on(editor.maze.clone());
+                match play_game(
+                    &mut stdout,
+                    &mut game,
+                    Arc::clone(&editor.evaluator),
+                    editor.solver_threads,
+                )? {
+                    PostGame::Menu => {}
+                    PostGame::Quit => return Ok(()),
+                }
+            }
+            MenuChoice::HumanVsCpu => {
+                let mut game = Game::human_vs_cpu_on(editor.maze.clone());
+                match play_game(
+                    &mut stdout,
+                    &mut game,
+                    Arc::clone(&editor.evaluator),
+                    editor.solver_threads,
+                )? {
+                    PostGame::Menu => {}
+                    PostGame::Quit => return Ok(()),
+                }
+            }
+            MenuChoice::Editor => match edit_board(&mut stdout, &mut editor)? {
                 PostGame::Menu => continue,
                 PostGame::Quit => return Ok(()),
             },
-        };
-
-        match play_game(&mut stdout, &mut game)? {
-            PostGame::Menu => {}
-            PostGame::Quit => return Ok(()),
         }
     }
 }
@@ -194,6 +214,7 @@ struct Editor {
     col: usize,
     target: EditTarget,
     evaluator: Arc<DfsSolver>,
+    solver_threads: usize,
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
@@ -206,7 +227,8 @@ impl Editor {
             row: 0,
             col: 0,
             target: EditTarget::Node,
-            evaluator: new_evaluator(),
+            evaluator: new_evaluator(DEFAULT_SOLVER_THREADS),
+            solver_threads: DEFAULT_SOLVER_THREADS,
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
@@ -242,9 +264,22 @@ impl Editor {
     }
 
     fn clear_cache(&mut self) {
-        self.evaluator = new_evaluator();
+        self.evaluator = new_evaluator(self.solver_threads);
         self.last_evaluation = None;
         self.nimber_is_current = false;
+        self.last_cancelled = false;
+    }
+
+    fn adjust_solver_threads(&mut self, delta: isize) {
+        let threads = self
+            .solver_threads
+            .saturating_add_signed(delta)
+            .clamp(1, MAX_SOLVER_THREADS);
+        if threads == self.solver_threads {
+            return;
+        }
+        self.solver_threads = threads;
+        self.evaluator = new_evaluator(threads);
         self.last_cancelled = false;
     }
 
@@ -293,8 +328,21 @@ impl Editor {
     }
 }
 
-fn new_evaluator() -> Arc<DfsSolver> {
-    Arc::new(DfsSolver::default())
+const DEFAULT_SOLVER_THREADS: usize = 6;
+const MAX_SOLVER_THREADS: usize = 64;
+
+fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
+    Arc::new(
+        Evaluator::with_config(
+            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            InvolutionSymmetryFinder,
+            EvaluatorConfig {
+                threads: Some(threads),
+                ..EvaluatorConfig::default()
+            },
+        )
+        .expect("failed to create evaluator worker pool"),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -306,11 +354,9 @@ struct EvaluationReport {
     matrix_nodes: usize,
 }
 
-fn edit_board(stdout: &mut impl Write) -> io::Result<PostGame> {
-    let mut editor = Editor::new();
-
+fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGame> {
     loop {
-        render_editor(stdout, &editor, None)?;
+        render_editor(stdout, editor, None)?;
 
         if let Event::Key(key) = event::read()?
             && is_press(key)
@@ -322,8 +368,10 @@ fn edit_board(stdout: &mut impl Write) -> io::Result<PostGame> {
                 KeyCode::Right | KeyCode::Char('l') => editor.move_cursor(0, 1),
                 KeyCode::Tab => editor.cycle_target(),
                 KeyCode::Char(' ') => editor.toggle_current(),
-                KeyCode::Char('n') => evaluate_editor(stdout, &mut editor)?,
+                KeyCode::Char('n') => evaluate_editor(stdout, editor)?,
                 KeyCode::Char('c') => editor.clear_cache(),
+                KeyCode::Char('[') => editor.adjust_solver_threads(-1),
+                KeyCode::Char(']') => editor.adjust_solver_threads(1),
                 KeyCode::Char('r') => editor.reset_demo(),
                 KeyCode::Char('o') => editor.reset_open(),
                 KeyCode::Char('+') | KeyCode::Char('=') => editor.resize(1, 0),
@@ -361,7 +409,11 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
                 return Ok(());
             }
             Err(mpsc::TryRecvError::Empty) => {
-                render_editor(stdout, editor, Some((evaluator.stats(), started.elapsed())))?;
+                render_editor(
+                    stdout,
+                    editor,
+                    Some((evaluator.progress(), started.elapsed())),
+                )?;
                 if event::poll(Duration::from_millis(100))?
                     && let Event::Key(key) = event::read()?
                     && is_press(key)
@@ -396,12 +448,26 @@ enum PostGame {
     Quit,
 }
 
-fn play_game(stdout: &mut impl Write, game: &mut Game) -> io::Result<PostGame> {
+fn play_game(
+    stdout: &mut impl Write,
+    game: &mut Game,
+    solver: Arc<DfsSolver>,
+    solver_threads: usize,
+) -> io::Result<PostGame> {
     let mut selection = Selection::new();
-    let solver = DfsSolver::default();
+    let initial_maze = game.maze.clone();
+    let shows_solver_panel = game
+        .players
+        .iter()
+        .any(|player| player.kind == PlayerKind::SolverCpu);
 
     loop {
-        render(stdout, game, &selection)?;
+        let panel = shows_solver_panel.then(|| SolverPanel {
+            status: "Solver cache",
+            progress: solver.progress(),
+            threads: solver_threads,
+        });
+        render(stdout, game, &selection, panel)?;
 
         if game.winner.is_some() {
             if let Event::Key(key) = event::read()?
@@ -411,9 +477,9 @@ fn play_game(stdout: &mut impl Write, game: &mut Game) -> io::Result<PostGame> {
                     KeyCode::Char('r') => {
                         let cpu = game.players[1].kind == PlayerKind::SolverCpu;
                         *game = if cpu {
-                            Game::human_vs_cpu()
+                            Game::human_vs_cpu_on(initial_maze.clone())
                         } else {
-                            Game::human_vs_human()
+                            Game::human_vs_human_on(initial_maze.clone())
                         };
                         selection = Selection::new();
                     }
@@ -426,10 +492,10 @@ fn play_game(stdout: &mut impl Write, game: &mut Game) -> io::Result<PostGame> {
         }
 
         if game.current_player().kind == PlayerKind::SolverCpu {
-            thread::sleep(Duration::from_millis(450));
-            if let Some(movement) = solver_move(&game.maze, &solver) {
-                game.play(movement)
-                    .expect("the solver CPU must generate a legal move");
+            match run_cpu_turn(stdout, game, &selection, Arc::clone(&solver), solver_threads)? {
+                CpuTurn::Played => {}
+                CpuTurn::Cancelled => return Ok(PostGame::Menu),
+                CpuTurn::Quit => return Ok(PostGame::Quit),
             }
             continue;
         }
@@ -459,11 +525,109 @@ fn play_game(stdout: &mut impl Write, game: &mut Game) -> io::Result<PostGame> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SolverPanel {
+    status: &'static str,
+    progress: EvaluatorProgress,
+    threads: usize,
+}
+
+enum CpuTurn {
+    Played,
+    Cancelled,
+    Quit,
+}
+
+fn run_cpu_turn(
+    stdout: &mut impl Write,
+    game: &mut Game,
+    selection: &Selection,
+    solver: Arc<DfsSolver>,
+    solver_threads: usize,
+) -> io::Result<CpuTurn> {
+    let maze = game.maze.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_solver = Arc::clone(&solver);
+    let (sender, receiver) = mpsc::channel();
+    let started = Instant::now();
+
+    let handle = thread::spawn(move || {
+        let result = solver_move_cancellable(&maze, &worker_solver, &worker_cancel);
+        let _ = sender.send(result);
+    });
+
+    let result = loop {
+        match receiver.try_recv() {
+            Ok(result) => break result,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                handle.join().expect("CPU solver worker panicked");
+                return Ok(CpuTurn::Cancelled);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                let status = if cancel.load(Ordering::Relaxed) {
+                    "CPU cancelling..."
+                } else {
+                    "CPU thinking... Esc/x: cancel"
+                };
+                render(
+                    stdout,
+                    game,
+                    selection,
+                    Some(SolverPanel {
+                        status,
+                        progress: solver.progress(),
+                        threads: solver_threads,
+                    }),
+                )?;
+                queue!(
+                    stdout,
+                    Print(format!("CPU turn elapsed: {:.2?}\r\n", started.elapsed()))
+                )?;
+                stdout.flush()?;
+
+                if event::poll(Duration::from_millis(100))?
+                    && let Event::Key(key) = event::read()?
+                    && is_press(key)
+                {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('x') => {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        KeyCode::Char('q') => {
+                            cancel.store(true, Ordering::Relaxed);
+                            handle.join().expect("CPU solver worker panicked");
+                            return Ok(CpuTurn::Quit);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
+
+    handle.join().expect("CPU solver worker panicked");
+    match result {
+        SolverMoveResult::Move(movement) => {
+            game.play(movement)
+                .expect("the solver CPU must generate a legal move");
+            Ok(CpuTurn::Played)
+        }
+        SolverMoveResult::NoMove => Ok(CpuTurn::Played),
+        SolverMoveResult::Cancelled => Ok(CpuTurn::Cancelled),
+    }
+}
+
 fn is_press(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-fn render(stdout: &mut impl Write, game: &Game, selection: &Selection) -> io::Result<()> {
+fn render(
+    stdout: &mut impl Write,
+    game: &Game,
+    selection: &Selection,
+    solver_panel: Option<SolverPanel>,
+) -> io::Result<()> {
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     if let Some(winner) = game.winner {
@@ -517,13 +681,23 @@ fn render(stdout: &mut impl Write, game: &Game, selection: &Selection) -> io::Re
         )?;
     }
 
+    if let Some(panel) = solver_panel {
+        queue!(
+            stdout,
+            Print("\r\n\r\n"),
+            Print(panel.status),
+            Print("\r\n")
+        )?;
+        render_progress(stdout, panel.progress)?;
+    }
+
     stdout.flush()
 }
 
 fn render_editor(
     stdout: &mut impl Write,
     editor: &Editor,
-    computing: Option<(EvaluatorStats, Duration)>,
+    computing: Option<(EvaluatorProgress, Duration)>,
 ) -> io::Result<()> {
     queue!(
         stdout,
@@ -548,9 +722,9 @@ fn render_editor(
     render_editor_maze(stdout, editor)?;
     queue!(stdout, Print("\r\n"))?;
 
-    let (stats, cache_entries) = computing
-        .map(|(stats, _)| (stats, editor.evaluator.cache_len()))
-        .unwrap_or_else(|| (editor.evaluator.stats(), editor.evaluator.cache_len()));
+    let progress = computing
+        .map(|(progress, _)| progress)
+        .unwrap_or_else(|| editor.evaluator.progress());
 
     if let Some((_, elapsed)) = computing {
         queue!(
@@ -604,25 +778,28 @@ fn render_editor(
             Print("nimber: not computed for this edit state\r\n")
         )?;
     }
-    render_stats(stdout, stats, cache_entries)?;
+    render_progress(stdout, progress)?;
 
     stdout.flush()
 }
 
-fn render_stats(
-    stdout: &mut impl Write,
-    stats: EvaluatorStats,
-    cache_entries: usize,
-) -> io::Result<()> {
+fn render_progress(stdout: &mut impl Write, progress: EvaluatorProgress) -> io::Result<()> {
+    let stats = progress.stats;
     queue!(
         stdout,
         Print(format!(
-            "attempts: {}    unique: {}    completed: {}    cache hits: {}    cache entries: {}\r\n",
+            "attempts: {}    unique: {}    completed: {}    cache hits: {}\r\n",
             stats.evaluation_attempts,
             stats.unique_positions_claimed,
             stats.completed_positions,
-            stats.completed_cache_hits,
-            cache_entries
+            stats.completed_cache_hits
+        )),
+        Print(format!(
+            "cache: {} done + {} processing = {} entries, ~{}\r\n",
+            progress.cache_done_entries,
+            progress.cache_processing_entries,
+            progress.cache_entries,
+            format_bytes(progress.estimated_cache_bytes)
         )),
         Print(format!(
             "busy hits: {}    deferred: {}    forced duplicates: {}\r\n",
@@ -631,8 +808,31 @@ fn render_stats(
         Print(format!(
             "symmetry zeros: {}    parallel expansions: {}\r\n",
             stats.symmetry_zero_certificates, stats.parallel_expansions
+        )),
+        Print(format!(
+            "rates: {:.0} eval/s    {:.0} unique/s    {:.0} cache hits/s    uptime: {:.2?}\r\n",
+            progress.evaluations_per_second,
+            progress.unique_positions_per_second,
+            progress.cache_hits_per_second,
+            progress.elapsed
         ))
     )
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as usize)
+    }
 }
 
 fn render_editor_maze(stdout: &mut impl Write, editor: &Editor) -> io::Result<()> {

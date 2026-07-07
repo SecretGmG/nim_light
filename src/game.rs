@@ -1,5 +1,9 @@
 use std::{
     collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -38,34 +42,48 @@ pub struct Game {
 
 impl Game {
     pub fn human_vs_human() -> Self {
-        Self::new([
-            Player {
-                name: "Player 1".into(),
-                kind: PlayerKind::Human,
-            },
-            Player {
-                name: "Player 2".into(),
-                kind: PlayerKind::Human,
-            },
-        ])
+        Self::human_vs_human_on(Maze::demo())
+    }
+
+    pub fn human_vs_human_on(maze: Maze) -> Self {
+        Self::new(
+            maze,
+            [
+                Player {
+                    name: "Player 1".into(),
+                    kind: PlayerKind::Human,
+                },
+                Player {
+                    name: "Player 2".into(),
+                    kind: PlayerKind::Human,
+                },
+            ],
+        )
     }
 
     pub fn human_vs_cpu() -> Self {
-        Self::new([
-            Player {
-                name: "Human".into(),
-                kind: PlayerKind::Human,
-            },
-            Player {
-                name: "CPU".into(),
-                kind: PlayerKind::SolverCpu,
-            },
-        ])
+        Self::human_vs_cpu_on(Maze::demo())
     }
 
-    fn new(players: [Player; 2]) -> Self {
+    pub fn human_vs_cpu_on(maze: Maze) -> Self {
+        Self::new(
+            maze,
+            [
+                Player {
+                    name: "Human".into(),
+                    kind: PlayerKind::Human,
+                },
+                Player {
+                    name: "CPU".into(),
+                    kind: PlayerKind::SolverCpu,
+                },
+            ],
+        )
+    }
+
+    fn new(maze: Maze, players: [Player; 2]) -> Self {
         Self {
-            maze: Maze::demo(),
+            maze,
             players,
             turn: 0,
             winner: None,
@@ -99,7 +117,26 @@ struct Corridor {
     alive: Vec<Cell>,
 }
 
+#[derive(Clone, Debug)]
+pub enum SolverMoveResult {
+    Move(Move),
+    NoMove,
+    Cancelled,
+}
+
 pub fn solver_move(maze: &Maze, solver: &DfsSolver) -> Option<Move> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    match solver_move_cancellable(maze, solver, &cancel) {
+        SolverMoveResult::Move(movement) => Some(movement),
+        SolverMoveResult::NoMove | SolverMoveResult::Cancelled => None,
+    }
+}
+
+pub fn solver_move_cancellable(
+    maze: &Maze,
+    solver: &DfsSolver,
+    cancel: &Arc<AtomicBool>,
+) -> SolverMoveResult {
     let corridors = alive_corridors(maze);
     let max_take = corridors
         .iter()
@@ -109,26 +146,33 @@ pub fn solver_move(maze: &Maze, solver: &DfsSolver) -> Option<Move> {
     let mut fallback = None;
 
     for take in (1..=max_take).rev() {
+        if cancel.load(Ordering::Relaxed) {
+            return SolverMoveResult::Cancelled;
+        }
         for corridor in corridors
             .iter()
             .filter(|corridor| corridor.alive.len() >= take)
         {
+            if cancel.load(Ordering::Relaxed) {
+                return SolverMoveResult::Cancelled;
+            }
             let mut selected = Vec::with_capacity(take);
-            if let Some(movement) = winning_combination(
+            let mut search = SolverSearch {
                 maze,
                 solver,
                 corridor,
-                take,
-                0,
-                &mut selected,
-                &mut fallback,
-            ) {
-                return Some(movement);
+                cancel,
+                fallback: &mut fallback,
+            };
+            match search.winning_combination(take, 0, &mut selected) {
+                SolverMoveResult::Move(movement) => return SolverMoveResult::Move(movement),
+                SolverMoveResult::Cancelled => return SolverMoveResult::Cancelled,
+                SolverMoveResult::NoMove => {}
             }
         }
     }
 
-    fallback
+    fallback.map_or(SolverMoveResult::NoMove, SolverMoveResult::Move)
 }
 
 fn alive_corridors(maze: &Maze) -> Vec<Corridor> {
@@ -159,41 +203,59 @@ fn alive_corridors(maze: &Maze) -> Vec<Corridor> {
     result
 }
 
-fn winning_combination(
-    maze: &Maze,
-    solver: &DfsSolver,
-    corridor: &Corridor,
-    take: usize,
-    start: usize,
-    selected: &mut Vec<Cell>,
-    fallback: &mut Option<Move>,
-) -> Option<Move> {
-    if selected.len() == take {
-        let movement = Move {
-            axis: corridor.axis,
-            anchor: corridor.anchor,
-            cells: selected.clone(),
-        };
-        fallback.get_or_insert_with(|| movement.clone());
+struct SolverSearch<'a> {
+    maze: &'a Maze,
+    solver: &'a DfsSolver,
+    corridor: &'a Corridor,
+    cancel: &'a Arc<AtomicBool>,
+    fallback: &'a mut Option<Move>,
+}
 
-        let mut next = maze.clone();
-        next.apply_move(movement.axis, movement.anchor, &movement.cells)
-            .expect("generated solver moves must be legal");
-        return (solver.nimber(&compile_maze(&next)) == 0).then_some(movement);
-    }
-
-    let remaining = take - selected.len();
-    let last_start = corridor.alive.len() - remaining;
-    for index in start..=last_start {
-        selected.push(corridor.alive[index]);
-        if let Some(movement) =
-            winning_combination(maze, solver, corridor, take, index + 1, selected, fallback)
-        {
-            return Some(movement);
+impl SolverSearch<'_> {
+    fn winning_combination(
+        &mut self,
+        take: usize,
+        start: usize,
+        selected: &mut Vec<Cell>,
+    ) -> SolverMoveResult {
+        if self.cancel.load(Ordering::Relaxed) {
+            return SolverMoveResult::Cancelled;
         }
-        selected.pop();
+
+        if selected.len() == take {
+            let movement = Move {
+                axis: self.corridor.axis,
+                anchor: self.corridor.anchor,
+                cells: selected.clone(),
+            };
+            self.fallback.get_or_insert_with(|| movement.clone());
+
+            let mut next = self.maze.clone();
+            next.apply_move(movement.axis, movement.anchor, &movement.cells)
+                .expect("generated solver moves must be legal");
+            return match self
+                .solver
+                .nimber_cancellable(&compile_maze(&next), self.cancel)
+            {
+                Some(0) => SolverMoveResult::Move(movement),
+                Some(_) => SolverMoveResult::NoMove,
+                None => SolverMoveResult::Cancelled,
+            };
+        }
+
+        let remaining = take - selected.len();
+        let last_start = self.corridor.alive.len() - remaining;
+        for index in start..=last_start {
+            selected.push(self.corridor.alive[index]);
+            match self.winning_combination(take, index + 1, selected) {
+                SolverMoveResult::Move(movement) => return SolverMoveResult::Move(movement),
+                SolverMoveResult::Cancelled => return SolverMoveResult::Cancelled,
+                SolverMoveResult::NoMove => {}
+            }
+            selected.pop();
+        }
+        SolverMoveResult::NoMove
     }
-    None
 }
 
 /// A tiny PRNG is enough for an intentionally non-strategic CPU.

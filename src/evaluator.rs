@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use rayon::{
@@ -43,6 +44,8 @@ pub struct EvaluatorConfig {
     pub cache_shards: usize,
     pub parallel_depth: usize,
     pub parallel_move_threshold: usize,
+    pub max_cache_entries: Option<usize>,
+    pub cache_low_watermark: f64,
 }
 
 impl Default for EvaluatorConfig {
@@ -52,6 +55,8 @@ impl Default for EvaluatorConfig {
             cache_shards: 64,
             parallel_depth: 2,
             parallel_move_threshold: 32,
+            max_cache_entries: None,
+            cache_low_watermark: 0.95,
         }
     }
 }
@@ -78,6 +83,19 @@ pub struct EvaluatorStats {
     pub symmetry_zero_certificates: usize,
     /// Position evaluations that selected a parallel expansion path.
     pub parallel_expansions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EvaluatorProgress {
+    pub elapsed: Duration,
+    pub cache_entries: usize,
+    pub cache_done_entries: usize,
+    pub cache_processing_entries: usize,
+    pub estimated_cache_bytes: usize,
+    pub stats: EvaluatorStats,
+    pub evaluations_per_second: f64,
+    pub cache_hits_per_second: f64,
+    pub unique_positions_per_second: f64,
 }
 
 #[derive(Default)]
@@ -113,6 +131,14 @@ impl AtomicEvaluatorStats {
 
 struct ShardedCache {
     shards: Vec<Mutex<HashMap<CanonicalGame, CacheEntry>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CacheProfile {
+    entries: usize,
+    done: usize,
+    processing: usize,
+    estimated_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,9 +192,24 @@ impl ShardedCache {
 
     /// Returns true if this call inserted the value. A false result is a
     /// harmless completed-result race.
-    fn insert_if_absent(&self, game: CanonicalGame, nimber: usize) -> bool {
+    fn insert_if_absent(
+        &self,
+        game: CanonicalGame,
+        nimber: usize,
+        max_entries: Option<usize>,
+        low_watermark: f64,
+    ) -> bool {
         let shard = self.shard(&game);
         let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
+        if let Some(max_entries) = max_entries {
+            let shard_max = max_entries.div_ceil(self.shards.len()).max(1);
+            if guard.len() >= shard_max {
+                let target = ((shard_max as f64) * low_watermark.clamp(0.0, 1.0))
+                    .floor()
+                    .max(1.0) as usize;
+                evict_done_entries(&mut guard, target, stable_game_hash(&game));
+            }
+        }
         match guard.entry(game) {
             Entry::Vacant(entry) => {
                 entry.insert(CacheEntry::Done(nimber));
@@ -188,10 +229,30 @@ impl ShardedCache {
     }
 
     fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.lock().expect("cache shard poisoned").len())
-            .sum()
+        self.profile().entries
+    }
+
+    fn profile(&self) -> CacheProfile {
+        let mut profile = CacheProfile::default();
+        for shard in &self.shards {
+            let guard = shard.lock().expect("cache shard poisoned");
+            profile.entries += guard.len();
+            profile.estimated_bytes += std::mem::size_of::<HashMap<CanonicalGame, CacheEntry>>();
+            for (game, entry) in guard.iter() {
+                match entry {
+                    CacheEntry::Processing => profile.processing += 1,
+                    CacheEntry::Done(_) => profile.done += 1,
+                }
+                profile.estimated_bytes += estimate_cache_entry_bytes(game);
+            }
+        }
+        profile
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().expect("cache shard poisoned").clear();
+        }
     }
 
     fn clear_processing(&self) {
@@ -210,6 +271,56 @@ impl ShardedCache {
     }
 }
 
+fn evict_done_entries(
+    guard: &mut HashMap<CanonicalGame, CacheEntry>,
+    target: usize,
+    new_game_hash: u64,
+) {
+    while guard.len() > target {
+        let Some(victim) = guard
+            .iter()
+            .filter(|(_, entry)| matches!(entry, CacheEntry::Done(_)))
+            .max_by_key(|(game, _)| stable_game_hash(game) ^ new_game_hash.rotate_left(17))
+            .map(|(game, _)| game.clone())
+        else {
+            return;
+        };
+        guard.remove(&victim);
+    }
+}
+
+fn estimate_cache_entry_bytes(game: &CanonicalGame) -> usize {
+    std::mem::size_of::<CanonicalGame>()
+        + std::mem::size_of::<CacheEntry>()
+        + game
+            .components()
+            .iter()
+            .map(BitMatrix::estimated_bytes)
+            .sum::<usize>()
+}
+
+fn stable_game_hash(game: &CanonicalGame) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for component in game.components() {
+        hash = fnv_mix(hash, component.rows() as u64);
+        hash = fnv_mix(hash, component.cols() as u64);
+        for row in 0..component.rows() {
+            for &word in component.row_words(row) {
+                hash = fnv_mix(hash, word);
+            }
+        }
+    }
+    hash
+}
+
+fn fnv_mix(mut hash: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// The evaluator only depends on canonical successor generation and an
 /// optional symmetry-based zero certificate.
 pub struct Evaluator<G, S = NoSymmetryFinder> {
@@ -219,6 +330,7 @@ pub struct Evaluator<G, S = NoSymmetryFinder> {
     pool: ThreadPool,
     config: EvaluatorConfig,
     stats: AtomicEvaluatorStats,
+    created_at: Instant,
 }
 
 impl<G, S> Evaluator<G, S>
@@ -250,6 +362,7 @@ where
             pool: builder.build()?,
             config,
             stats: AtomicEvaluatorStats::default(),
+            created_at: Instant::now(),
         })
     }
 
@@ -291,12 +404,42 @@ where
         nimber
     }
 
+    pub fn cached_nimber_of_canonical(&self, game: &CanonicalGame) -> Option<usize> {
+        self.cache.get_done(game)
+    }
+
+    pub fn publish_nimber_of_canonical(&self, game: CanonicalGame, nimber: usize) {
+        self.cache_result(game, nimber);
+    }
+
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
+    pub fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
     pub fn stats(&self) -> EvaluatorStats {
         self.stats.snapshot()
+    }
+
+    pub fn progress(&self) -> EvaluatorProgress {
+        let elapsed = self.created_at.elapsed();
+        let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+        let stats = self.stats();
+        let cache = self.cache.profile();
+        EvaluatorProgress {
+            elapsed,
+            cache_entries: cache.entries,
+            cache_done_entries: cache.done,
+            cache_processing_entries: cache.processing,
+            estimated_cache_bytes: cache.estimated_bytes,
+            stats,
+            evaluations_per_second: stats.evaluation_attempts as f64 / seconds,
+            cache_hits_per_second: stats.completed_cache_hits as f64 / seconds,
+            unique_positions_per_second: stats.unique_positions_claimed as f64 / seconds,
+        }
     }
 
     pub fn generator(&self) -> &G {
@@ -531,7 +674,12 @@ where
     }
 
     fn cache_result(&self, game: CanonicalGame, nimber: usize) {
-        if self.cache.insert_if_absent(game, nimber) {
+        if self.cache.insert_if_absent(
+            game,
+            nimber,
+            self.config.max_cache_entries,
+            self.config.cache_low_watermark,
+        ) {
             self.stats
                 .completed_positions
                 .fetch_add(1, Ordering::Relaxed);
@@ -881,9 +1029,9 @@ mod tests {
         assert_eq!(cache.probe(&game), CacheProbe::Claimed);
         assert_eq!(cache.probe(&game), CacheProbe::Busy);
         assert_eq!(cache.get_done(&game), None);
-        assert!(cache.insert_if_absent(game.clone(), 2));
+        assert!(cache.insert_if_absent(game.clone(), 2, None, 0.95));
         assert_eq!(cache.probe(&game), CacheProbe::Done(2));
-        assert!(!cache.insert_if_absent(game, 2));
+        assert!(!cache.insert_if_absent(game, 2, None, 0.95));
     }
 
     #[test]

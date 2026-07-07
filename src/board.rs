@@ -86,6 +86,10 @@ impl BitMatrix {
             .sum()
     }
 
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.data.len() * std::mem::size_of::<u64>()
+    }
+
     pub fn row_words(&self, row: usize) -> &[u64] {
         assert!(row < self.rows);
         let start = row * self.words_per_row;
