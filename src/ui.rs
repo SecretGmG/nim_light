@@ -223,6 +223,7 @@ pub fn run() -> io::Result<()> {
                     &mut game,
                     Arc::clone(&editor.evaluator),
                     editor.solver_threads,
+                    editor.solver_config(),
                 )? {
                     PostGame::Menu => {}
                     PostGame::Quit => return Ok(()),
@@ -235,6 +236,7 @@ pub fn run() -> io::Result<()> {
                     &mut game,
                     Arc::clone(&editor.evaluator),
                     editor.solver_threads,
+                    editor.solver_config(),
                 )? {
                     PostGame::Menu => {}
                     PostGame::Quit => return Ok(()),
@@ -569,6 +571,7 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
     let report_shape = (matrix.rows(), matrix.cols(), matrix.count_ones());
     let evaluator = Arc::clone(&editor.evaluator);
     let worker_evaluator = Arc::clone(&evaluator);
+    let solver_config = editor.solver_config();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::channel();
@@ -576,7 +579,12 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
     let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
-        let nimber = worker_evaluator.nimber_cancellable(&matrix, &worker_cancel);
+        let nimber = worker_evaluator.nimber_cancellable_with_parallel_params(
+            &matrix,
+            solver_config.parallel_depth,
+            solver_config.permit_factor,
+            &worker_cancel,
+        );
         let _ = sender.send(nimber);
     });
 
