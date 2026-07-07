@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    env,
     hint::black_box,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -138,17 +139,59 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
     }
 }
 
+fn root_parallel_ab(c: &mut Criterion) {
+    let threads = bench_threads();
+    for (label, game) in labelled_benchmark_games() {
+        c.bench_function(
+            &format!("root_parallel/{threads}_threads/current/{label}"),
+            |bencher| {
+                bencher.iter(|| {
+                    let evaluator = new_evaluator_with_threads(threads);
+                    black_box(evaluator.nimber(&game));
+                });
+            },
+        );
+
+        c.bench_function(
+            &format!("root_parallel/{threads}_threads/forced_root/{label}"),
+            |bencher| {
+                bencher.iter(|| {
+                    let evaluator = new_evaluator_with_threads(threads);
+                    black_box(evaluator.nimber_root_parallel(&game));
+                });
+            },
+        );
+    }
+}
+
 fn new_evaluator() -> DfsSolver {
+    new_evaluator_with_threads(8)
+}
+
+fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
     Evaluator::with_config(
         CanonicalMoveGenerator::new(PseudoCanonicalizer),
         InvolutionSymmetryFinder,
         EvaluatorConfig {
-            threads: Some(8),
+            threads: Some(threads),
+            cache_shards: cache_shards_for_threads(threads),
             parallel_move_threshold: 32,
             ..EvaluatorConfig::default()
         },
     )
     .unwrap()
+}
+
+fn bench_threads() -> usize {
+    env::var("NIM_LIGHT_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(8)
+}
+
+fn cache_shards_for_threads(threads: usize) -> usize {
+    threads.saturating_mul(8).next_power_of_two().max(64)
 }
 
 fn hybrid_zero_move(
@@ -377,6 +420,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(30));
-    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move
+    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, root_parallel_ab
 }
 criterion_main!(benches);

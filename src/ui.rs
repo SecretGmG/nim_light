@@ -150,6 +150,55 @@ struct LastSpace {
 const DOUBLE_SPACE_WINDOW: Duration = Duration::from_millis(350);
 const SWEEP_FRAME: Duration = Duration::from_millis(28);
 const SOLVER_REFRESH: Duration = Duration::from_millis(350);
+const FULL_PROFILE_REFRESH: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct ProgressView {
+    progress: EvaluatorProgress,
+    profile_age: Option<Duration>,
+}
+
+impl ProgressView {
+    fn fresh(progress: EvaluatorProgress) -> Self {
+        Self {
+            progress,
+            profile_age: Some(Duration::ZERO),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgressSampler {
+    last_full: Option<(EvaluatorProgress, Instant)>,
+}
+
+impl ProgressSampler {
+    fn sample(&mut self, evaluator: &DfsSolver) -> ProgressView {
+        let now = Instant::now();
+        if self
+            .last_full
+            .as_ref()
+            .is_none_or(|(_, sampled_at)| sampled_at.elapsed() >= FULL_PROFILE_REFRESH)
+        {
+            let progress = evaluator.progress();
+            self.last_full = Some((progress, now));
+            return ProgressView::fresh(progress);
+        }
+
+        let mut progress = evaluator.cheap_progress();
+        let Some((full, sampled_at)) = self.last_full else {
+            return ProgressView {
+                progress,
+                profile_age: None,
+            };
+        };
+        progress.estimated_cache_bytes = full.estimated_cache_bytes;
+        ProgressView {
+            progress,
+            profile_age: Some(sampled_at.elapsed()),
+        }
+    }
+}
 
 pub fn run() -> io::Result<()> {
     let _terminal = TerminalGuard::enter()?;
@@ -434,6 +483,7 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
     let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::channel();
     let started = Instant::now();
+    let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
         let nimber = worker_evaluator.nimber_cancellable(&matrix, &worker_cancel);
@@ -451,7 +501,7 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
                 render_editor(
                     stdout,
                     editor,
-                    Some((evaluator.cheap_progress(), started.elapsed())),
+                    Some((progress.sample(&evaluator), started.elapsed())),
                 )?;
                 if event::poll(SOLVER_REFRESH)?
                     && let Event::Key(key) = event::read()?
@@ -504,7 +554,7 @@ fn play_game(
     loop {
         let panel = shows_solver_panel.then(|| SolverPanel {
             status: "Solver cache",
-            progress: solver.progress(),
+            progress: ProgressView::fresh(solver.progress()),
             threads: solver_threads,
         });
         render(stdout, game, &selection, panel)?;
@@ -579,7 +629,7 @@ fn play_game(
                     if is_double_space {
                         let panel = shows_solver_panel.then(|| SolverPanel {
                             status: "Solver cache",
-                            progress: solver.progress(),
+                            progress: ProgressView::fresh(solver.progress()),
                             threads: solver_threads,
                         });
                         let select = last_space
@@ -620,7 +670,7 @@ fn play_game(
 #[derive(Clone, Copy)]
 struct SolverPanel {
     status: &'static str,
-    progress: EvaluatorProgress,
+    progress: ProgressView,
     threads: usize,
 }
 
@@ -643,6 +693,7 @@ fn run_cpu_turn(
     let worker_solver = Arc::clone(&solver);
     let (sender, receiver) = mpsc::channel();
     let started = Instant::now();
+    let mut progress = ProgressSampler::default();
 
     let handle = thread::spawn(move || {
         let result = solver_move_cancellable(&maze, &worker_solver, &worker_cancel);
@@ -668,7 +719,7 @@ fn run_cpu_turn(
                     selection,
                     Some(SolverPanel {
                         status,
-                        progress: solver.cheap_progress(),
+                        progress: progress.sample(&solver),
                         threads: solver_threads,
                     }),
                 )?;
@@ -814,7 +865,7 @@ fn render(
 fn render_editor(
     stdout: &mut impl Write,
     editor: &Editor,
-    computing: Option<(EvaluatorProgress, Duration)>,
+    computing: Option<(ProgressView, Duration)>,
 ) -> io::Result<()> {
     queue!(
         stdout,
@@ -841,7 +892,7 @@ fn render_editor(
 
     let progress = computing
         .map(|(progress, _)| progress)
-        .unwrap_or_else(|| editor.evaluator.progress());
+        .unwrap_or_else(|| ProgressView::fresh(editor.evaluator.progress()));
 
     if let Some((_, elapsed)) = computing {
         queue!(
@@ -900,17 +951,24 @@ fn render_editor(
     stdout.flush()
 }
 
-fn render_progress(stdout: &mut impl Write, progress: EvaluatorProgress) -> io::Result<()> {
+fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()> {
+    let progress = view.progress;
     let stats = progress.stats;
-    let estimated_bytes = if progress.estimated_cache_bytes == 0 && progress.cache_entries > 0 {
-        "n/a".to_owned()
+    let estimated_bytes = if progress.estimated_cache_bytes == 0 && view.profile_age.is_none() {
+        "~n/a".to_owned()
+    } else if let Some(age) = view.profile_age {
+        format!(
+            "~{}, sampled {:.0}s ago",
+            format_bytes(progress.estimated_cache_bytes),
+            age.as_secs_f64()
+        )
     } else {
-        format_bytes(progress.estimated_cache_bytes)
+        format!("~{}", format_bytes(progress.estimated_cache_bytes))
     };
     queue!(
         stdout,
         Print(format!(
-            "evals {}  unique {}  done {}  hits {}  cache {}+{} (~{})\r\n",
+            "evals {}  unique {}  done {}  hits {}  cache {}+{} ({})\r\n",
             stats.evaluation_attempts,
             stats.unique_positions_claimed,
             stats.completed_positions,

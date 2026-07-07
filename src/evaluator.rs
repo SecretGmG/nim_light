@@ -374,6 +374,11 @@ where
         self.nimber_of_canonical(&game)
     }
 
+    pub fn nimber_root_parallel(&self, matrix: &BitMatrix) -> usize {
+        let game = self.generator.canonicalize(matrix.clone());
+        self.nimber_of_canonical_root_parallel(&game)
+    }
+
     pub fn nimber_cancellable(
         &self,
         matrix: &BitMatrix,
@@ -390,6 +395,12 @@ where
     pub fn nimber_of_canonical(&self, game: &CanonicalGame) -> usize {
         self.pool
             .install(|| self.nimber_inner(game, self.config.parallel_depth, None))
+            .expect("uncancellable evaluation must not be cancelled")
+    }
+
+    pub fn nimber_of_canonical_root_parallel(&self, game: &CanonicalGame) -> usize {
+        self.pool
+            .install(|| self.nimber_root_parallel_inner(game, None))
             .expect("uncancellable evaluation must not be cancelled")
     }
 
@@ -492,6 +503,50 @@ where
         .into()
     }
 
+    fn nimber_root_parallel_inner(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if game.is_empty() {
+            return Some(0);
+        }
+
+        Some(match self.cache.probe(game) {
+            CacheProbe::Done(nimber) => {
+                self.stats
+                    .completed_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                nimber
+            }
+            CacheProbe::Busy => {
+                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                if let Some(nimber) = self.cache.get_done(game) {
+                    self.stats
+                        .completed_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    nimber
+                } else {
+                    self.evaluate_duplicate(game, self.config.parallel_depth, cancel)?
+                }
+            }
+            CacheProbe::Claimed => {
+                self.stats
+                    .unique_positions_claimed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .evaluation_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let nimber = self.compute_position_root_parallel(game, cancel)?;
+                self.cache_result(game.clone(), nimber);
+                nimber
+            }
+        })
+    }
+
     fn try_nimber(
         &self,
         game: &CanonicalGame,
@@ -543,6 +598,30 @@ where
             self.nimber_of_components(game, parallel_depth, cancel)
         } else {
             self.nimber_of_component(&game.components()[0], parallel_depth, cancel)
+        }
+    }
+
+    fn compute_position_root_parallel(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if game.components().len() > 1 {
+            self.stats
+                .parallel_expansions
+                .fetch_add(1, Ordering::Relaxed);
+            let nimbers: Option<Vec<_>> = (0..game.components().len())
+                .into_par_iter()
+                .map(|index| {
+                    self.nimber_inner(&game.component(index), self.config.parallel_depth, cancel)
+                })
+                .collect();
+            nimbers.map(|nimbers| nimbers.into_iter().fold(0, |left, right| left ^ right))
+        } else {
+            self.nimber_of_component_root_parallel(&game.components()[0], cancel)
         }
     }
 
@@ -665,6 +744,60 @@ where
                 worker.reachable
             };
         Some(reachable.mex())
+    }
+
+    fn nimber_of_component_root_parallel(
+        &self,
+        component: &BitMatrix,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if self.symmetry_finder.proves_zero(component) {
+            self.stats
+                .symmetry_zero_certificates
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(0);
+        }
+
+        self.stats
+            .parallel_expansions
+            .fetch_add(1, Ordering::Relaxed);
+        let bound = component.count_ones() + 1;
+        let successors: Vec<_> = self.generator.successors(component).collect();
+        let worker = successors
+            .into_par_iter()
+            .fold(
+                || WorkerResult::new(bound),
+                |mut worker, successor| {
+                    if is_cancelled(cancel) {
+                        worker.cancelled = true;
+                    } else {
+                        worker.push(
+                            self.try_nimber(&successor, self.config.parallel_depth, cancel),
+                            successor,
+                        );
+                    }
+                    worker
+                },
+            )
+            .map(|mut worker| {
+                self.resolve_pending(&mut worker, self.config.parallel_depth, cancel);
+                worker
+            })
+            .reduce(
+                || WorkerResult::new(bound),
+                |mut left, right| {
+                    left.cancelled |= right.cancelled;
+                    left.reachable.union_with(&right.reachable);
+                    left
+                },
+            );
+        if worker.cancelled {
+            return None;
+        }
+        Some(worker.reachable.mex())
     }
 
     fn resolve_pending(
@@ -1125,6 +1258,24 @@ mod tests {
 
         assert_eq!(parallel.nimber(&matrix), sequential.nimber(&matrix));
         assert!(parallel.stats().parallel_expansions > 0);
+    }
+
+    #[test]
+    fn root_parallel_evaluator_agrees_with_regular_evaluator() {
+        for matrix in [
+            heap(6),
+            dense_rectangle(3, 4),
+            dense_rectangle(2, 5),
+            spiral_maze_game(3, 3),
+        ] {
+            let regular = DfsSolver::default();
+            let root_parallel = DfsSolver::default();
+            assert_eq!(
+                root_parallel.nimber_root_parallel(&matrix),
+                regular.nimber(&matrix)
+            );
+            assert!(root_parallel.stats().parallel_expansions > 0);
+        }
     }
 
     fn dense_grid(size: usize) -> BitMatrix {
