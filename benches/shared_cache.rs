@@ -139,11 +139,21 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
     }
 }
 
-fn root_parallel_ab(c: &mut Criterion) {
+fn permit_parallel_ab(c: &mut Criterion) {
     let threads = bench_threads();
     for (label, game) in labelled_benchmark_games() {
         c.bench_function(
-            &format!("root_parallel/{threads}_threads/current/{label}"),
+            &format!("permit_parallel/{threads}_threads/depth_0_dfs_fallback/{label}"),
+            |bencher| {
+                bencher.iter(|| {
+                    let evaluator = new_evaluator_with_threads(threads);
+                    black_box(evaluator.nimber_with_parallel_params(&game, 0, 8));
+                });
+            },
+        );
+
+        c.bench_function(
+            &format!("permit_parallel/{threads}_threads/depth_2_default/{label}"),
             |bencher| {
                 bencher.iter(|| {
                     let evaluator = new_evaluator_with_threads(threads);
@@ -153,63 +163,11 @@ fn root_parallel_ab(c: &mut Criterion) {
         );
 
         c.bench_function(
-            &format!("root_parallel/{threads}_threads/forced_root/{label}"),
+            &format!("permit_parallel/{threads}_threads/depth_3/{label}"),
             |bencher| {
                 bencher.iter(|| {
                     let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_root_parallel(&game));
-                });
-            },
-        );
-    }
-}
-
-fn grouped_parallel_ab(c: &mut Criterion) {
-    let threads = bench_threads();
-    for (label, game) in labelled_benchmark_games() {
-        c.bench_function(
-            &format!("grouped_parallel/{threads}_threads/current/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber(&game));
-                });
-            },
-        );
-
-        for spread_depth in 1..=3 {
-            c.bench_function(
-                &format!("grouped_parallel/{threads}_threads/depth_{spread_depth}/{label}"),
-                |bencher| {
-                    bencher.iter(|| {
-                        let evaluator = new_evaluator_with_threads(threads);
-                        black_box(evaluator.nimber_grouped_parallel(&game, spread_depth));
-                    });
-                },
-            );
-        }
-    }
-}
-
-fn grouped_permit_parallel_ab(c: &mut Criterion) {
-    let threads = bench_threads();
-    for (label, game) in labelled_benchmark_games() {
-        c.bench_function(
-            &format!("grouped_permit_parallel/{threads}_threads/current/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber(&game));
-                });
-            },
-        );
-
-        c.bench_function(
-            &format!("grouped_permit_parallel/{threads}_threads/default/{label}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator_with_threads(threads);
-                    black_box(evaluator.nimber_grouped_permit_parallel(&game));
+                    black_box(evaluator.nimber_with_parallel_params(&game, 3, 8));
                 });
             },
         );
@@ -472,6 +430,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(30));
-    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, root_parallel_ab, grouped_parallel_ab, grouped_permit_parallel_ab
+    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move, permit_parallel_ab
 }
 criterion_main!(benches);
