@@ -110,6 +110,33 @@ The local wall-time change is small, but the contention/collision metrics moved
 in the intended direction. This should be tested on the 128-core machine, where
 reducing deferred successor materialization and worker correlation matters more.
 
+### Game/depth-mixed traversal seeds
+
+Group traversal order is now seeded from the worker id, current recursion depth,
+and a stable hash of the current component. This keeps the deterministic
+strided traversal model, but avoids reusing the same worker-relative group order
+at every recursive position.
+
+Local 8-thread diagnostic was neutral:
+
+```text
+total seconds: 25.266
+distribution: groups 424031  avg_group_size 4.80  deferrals 1933  revisits 1933
+forced duplicates: 572
+```
+
+The previous indexed-groups run was:
+
+```text
+total seconds: 25.189
+distribution: groups 423912  avg_group_size 4.79  deferrals 1932  revisits 1932
+forced duplicates: 566
+```
+
+So this is not a local improvement. It is retained for now because the target
+failure mode is large-machine worker correlation, which the local 8-thread
+benchmark does not reproduce well.
+
 ### Adjacent duplicate row skip in move generation
 
 `CanonicalSuccessors` previously used `HashSet<Vec<u64>>` to skip duplicate row

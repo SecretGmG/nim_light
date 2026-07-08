@@ -602,15 +602,31 @@ fn estimate_cache_entry_bytes(game: &CanonicalGame) -> usize {
 fn stable_game_hash(game: &CanonicalGame) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for component in game.components() {
-        hash = fnv_mix(hash, component.rows() as u64);
-        hash = fnv_mix(hash, component.cols() as u64);
-        for row in 0..component.rows() {
-            for &word in component.row_words(row) {
-                hash = fnv_mix(hash, word);
-            }
+        hash = stable_matrix_hash_from(hash, component);
+    }
+    hash
+}
+
+fn stable_matrix_hash(matrix: &BitMatrix) -> u64 {
+    stable_matrix_hash_from(0xcbf2_9ce4_8422_2325u64, matrix)
+}
+
+fn stable_matrix_hash_from(mut hash: u64, matrix: &BitMatrix) -> u64 {
+    hash = fnv_mix(hash, matrix.rows() as u64);
+    hash = fnv_mix(hash, matrix.cols() as u64);
+    for row in 0..matrix.rows() {
+        for &word in matrix.row_words(row) {
+            hash = fnv_mix(hash, word);
         }
     }
     hash
+}
+
+fn traversal_seed(component: &BitMatrix, depth: usize, worker_seed: usize) -> usize {
+    let mut hash = stable_matrix_hash(component);
+    hash = fnv_mix(hash, depth as u64);
+    hash = fnv_mix(hash, worker_seed as u64);
+    (hash ^ hash.rotate_right(32)) as usize
 }
 
 fn fnv_mix(mut hash: u64, value: u64) -> u64 {
@@ -822,7 +838,7 @@ where
         if is_cancelled(cancel) {
             return None;
         }
-        match self.try_nimber(game, cancel, EvaluationPolicy::Serial)? {
+        match self.try_nimber(game, cancel, EvaluationPolicy::Serial, 0)? {
             Evaluation::Ready { nimber, .. } => nimber,
             Evaluation::Busy => {
                 if let Some(nimber) = self.cache.get_done(game) {
@@ -831,7 +847,7 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     return Some(nimber);
                 }
-                self.evaluate_duplicate(game, cancel)?
+                self.evaluate_duplicate(game, cancel, 0)?
             }
         }
         .into()
@@ -864,7 +880,7 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                     nimber
                 } else {
-                    self.evaluate_duplicate(game, cancel)?
+                    self.evaluate_duplicate(game, cancel, 0)?
                 }
             }
             CacheProbe::Claimed => {
@@ -886,6 +902,7 @@ where
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
+        depth: usize,
     ) -> Option<Evaluation> {
         if is_cancelled(cancel) {
             return None;
@@ -918,7 +935,7 @@ where
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
-                let nimber = self.compute_position(game, cancel, policy)?;
+                let nimber = self.compute_position(game, cancel, policy, depth)?;
                 self.cache_result(game.clone(), nimber);
                 Evaluation::Ready {
                     nimber,
@@ -933,14 +950,15 @@ where
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
+        depth: usize,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
         if game.components().len() > 1 {
-            self.nimber_of_components(game, cancel, policy)
+            self.nimber_of_components(game, cancel, policy, depth)
         } else {
-            self.nimber_of_component(&game.components()[0], cancel, policy)
+            self.nimber_of_component(&game.components()[0], cancel, policy, depth)
         }
     }
 
@@ -953,7 +971,7 @@ where
             return None;
         }
         if game.components().len() > 1 {
-            return self.nimber_of_components(game, cancel, EvaluationPolicy::Serial);
+            return self.nimber_of_components(game, cancel, EvaluationPolicy::Serial, 0);
         }
         self.nimber_of_component_cooperative_root(&game.components()[0], cancel)
     }
@@ -962,8 +980,9 @@ where
         &self,
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
+        depth: usize,
     ) -> Option<usize> {
-        self.evaluate_duplicate_with_policy(game, cancel, EvaluationPolicy::Serial)
+        self.evaluate_duplicate_with_policy(game, cancel, EvaluationPolicy::Serial, depth)
     }
 
     fn evaluate_duplicate_with_policy(
@@ -971,6 +990,7 @@ where
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
+        depth: usize,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
@@ -981,7 +1001,7 @@ where
         self.stats
             .evaluation_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let nimber = self.compute_position(game, cancel, policy)?;
+        let nimber = self.compute_position(game, cancel, policy, depth)?;
         self.cache_result(game.clone(), nimber);
         Some(nimber)
     }
@@ -991,6 +1011,7 @@ where
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
+        depth: usize,
     ) -> Option<usize> {
         let mut nimber = 0;
         for index in 0..game.components().len() {
@@ -998,11 +1019,16 @@ where
             nimber ^= match policy {
                 EvaluationPolicy::Serial => self.nimber_inner(&component, cancel)?,
                 EvaluationPolicy::CooperativeAssist => {
-                    match self.try_nimber(&component, cancel, policy)? {
+                    match self.try_nimber(&component, cancel, policy, depth + 1)? {
                         Evaluation::Ready { nimber, .. } => nimber,
                         Evaluation::Busy => {
                             self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
-                            self.evaluate_duplicate_with_policy(&component, cancel, policy)?
+                            self.evaluate_duplicate_with_policy(
+                                &component,
+                                cancel,
+                                policy,
+                                depth + 1,
+                            )?
                         }
                     }
                 }
@@ -1016,6 +1042,7 @@ where
         component: &BitMatrix,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
+        depth: usize,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
@@ -1033,6 +1060,12 @@ where
             self.generator.successor_groups(component),
             &mut worker,
             policy,
+            traversal_seed(
+                component,
+                depth,
+                self.pool.current_thread_index().unwrap_or(0),
+            ),
+            depth,
             cancel,
         );
         self.stats.flush_distribution(worker.distribution);
@@ -1078,7 +1111,8 @@ where
                         self.generator.successor_groups(component),
                         &mut local,
                         EvaluationPolicy::CooperativeAssist,
-                        worker_seed,
+                        traversal_seed(component, 0, worker_seed),
+                        0,
                         cancel,
                     );
                     self.stats.worker_finished();
@@ -1106,17 +1140,13 @@ where
         groups: IG,
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
+        seed: usize,
+        depth: usize,
         cancel: Option<&AtomicBool>,
     ) where
         IG: IndexedSuccessorGroups,
     {
-        self.evaluate_successor_groups_with_seed(
-            groups,
-            worker,
-            policy,
-            self.pool.current_thread_index().unwrap_or(0),
-            cancel,
-        );
+        self.evaluate_successor_groups_with_seed(groups, worker, policy, seed, depth, cancel);
     }
 
     fn evaluate_successor_groups_with_seed<IG>(
@@ -1125,6 +1155,7 @@ where
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
         seed: usize,
+        depth: usize,
         cancel: Option<&AtomicBool>,
     ) where
         IG: IndexedSuccessorGroups,
@@ -1136,13 +1167,19 @@ where
                 DeferredGroup::new(group_index),
                 worker,
                 &mut deferred,
-                GroupEvalContext::new(policy, DeferMode::Fresh, cancel),
+                GroupEvalContext::new(policy, DeferMode::Fresh, depth, cancel),
             );
             if worker.cancelled {
                 return;
             }
         }
-        self.revisit_deferred_groups(deferred, &groups, worker, policy, seed, cancel);
+        self.revisit_deferred_groups(
+            deferred,
+            &groups,
+            worker,
+            seed,
+            GroupEvalContext::new(policy, DeferMode::Revisit, depth, cancel),
+        );
         self.resolve_pending(worker, cancel);
     }
 
@@ -1151,9 +1188,8 @@ where
         deferred: Vec<DeferredGroup>,
         groups: &IG,
         worker: &mut WorkerResult,
-        policy: EvaluationPolicy,
         seed: usize,
-        cancel: Option<&AtomicBool>,
+        context: GroupEvalContext<'_>,
     ) where
         IG: IndexedSuccessorGroups,
     {
@@ -1165,7 +1201,7 @@ where
                 group,
                 worker,
                 &mut Vec::new(),
-                GroupEvalContext::new(policy, DeferMode::Revisit, cancel),
+                context,
             );
             if worker.cancelled {
                 return;
@@ -1200,7 +1236,12 @@ where
                 return;
             }
             let successor = groups.successor(group.group_index, move_index);
-            match self.try_nimber(&successor, context.cancel, context.policy) {
+            match self.try_nimber(
+                &successor,
+                context.cancel,
+                context.policy,
+                context.depth + 1,
+            ) {
                 Some(Evaluation::Ready { nimber, claimed }) => {
                     had_new_claim |= claimed;
                     worker.reachable.insert(nimber);
@@ -1234,6 +1275,7 @@ where
                                         &successor,
                                         context.cancel,
                                         context.policy,
+                                        context.depth + 1,
                                     ) else {
                                         worker.cancelled = true;
                                         worker.record_successor_group(
@@ -1278,7 +1320,7 @@ where
                 self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
                 nimber
             } else {
-                let Some(nimber) = self.evaluate_duplicate(&game, cancel) else {
+                let Some(nimber) = self.evaluate_duplicate(&game, cancel, 0) else {
                     worker.cancelled = true;
                     return;
                 };
@@ -1328,6 +1370,7 @@ enum DeferMode {
 struct GroupEvalContext<'a> {
     policy: EvaluationPolicy,
     defer_mode: DeferMode,
+    depth: usize,
     cancel: Option<&'a AtomicBool>,
 }
 
@@ -1335,11 +1378,13 @@ impl<'a> GroupEvalContext<'a> {
     fn new(
         policy: EvaluationPolicy,
         defer_mode: DeferMode,
+        depth: usize,
         cancel: Option<&'a AtomicBool>,
     ) -> Self {
         Self {
             policy,
             defer_mode,
+            depth,
             cancel,
         }
     }
