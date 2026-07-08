@@ -299,6 +299,7 @@ struct Editor {
     target: EditTarget,
     evaluator: Arc<DfsSolver>,
     solver_threads: usize,
+    cache_shards: usize,
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
@@ -307,13 +308,16 @@ struct Editor {
 
 impl Editor {
     fn new() -> Self {
+        let solver_threads = DEFAULT_SOLVER_THREADS;
+        let cache_shards = cache_shards_for_threads(solver_threads);
         Self {
             maze: Maze::demo(),
             row: 0,
             col: 0,
             target: EditTarget::Node,
-            evaluator: new_evaluator(DEFAULT_SOLVER_THREADS),
-            solver_threads: DEFAULT_SOLVER_THREADS,
+            evaluator: new_evaluator(solver_threads, cache_shards),
+            solver_threads,
+            cache_shards,
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
@@ -350,36 +354,56 @@ impl Editor {
     }
 
     fn clear_cache(&mut self) {
-        self.evaluator = new_evaluator(self.solver_threads);
+        self.evaluator = new_evaluator(self.solver_threads, self.cache_shards);
         self.last_evaluation = None;
         self.nimber_is_current = false;
         self.last_cancelled = false;
         self.cache_status = Some("cache cleared".to_owned());
     }
 
-    fn adjust_solver_threads(&mut self, delta: isize) {
-        let threads = self
-            .solver_threads
-            .saturating_add_signed(delta)
-            .clamp(1, MAX_SOLVER_THREADS);
+    fn set_solver_threads(&mut self, threads: usize) {
+        let threads = threads.clamp(1, MAX_SOLVER_THREADS);
         if threads == self.solver_threads {
             return;
         }
-        let cache_shards = cache_shards_for_threads(threads);
         match self
             .evaluator
-            .with_threads_preserving_cache(threads, cache_shards)
+            .with_threads_preserving_cache(threads, self.cache_shards)
         {
             Ok(evaluator) => {
                 self.solver_threads = threads;
                 self.evaluator = Arc::new(evaluator);
                 self.last_cancelled = false;
                 self.cache_status = Some(format!(
-                    "threads set to {threads}; completed cache entries preserved"
+                    "threads set to {threads}; {shards} cache shards preserved",
+                    shards = self.cache_shards
                 ));
             }
             Err(error) => {
                 self.cache_status = Some(format!("failed to change threads: {error}"));
+            }
+        }
+    }
+
+    fn set_cache_shards(&mut self, shards: usize) {
+        let shards = shards.clamp(1, MAX_CACHE_SHARDS);
+        if shards == self.cache_shards {
+            return;
+        }
+        match self
+            .evaluator
+            .with_threads_preserving_cache(self.solver_threads, shards)
+        {
+            Ok(evaluator) => {
+                self.cache_shards = shards;
+                self.evaluator = Arc::new(evaluator);
+                self.last_cancelled = false;
+                self.cache_status = Some(format!(
+                    "cache shards set to {shards}; completed entries re-sharded"
+                ));
+            }
+            Err(error) => {
+                self.cache_status = Some(format!("failed to change cache shards: {error}"));
             }
         }
     }
@@ -459,11 +483,11 @@ impl Editor {
 }
 
 const DEFAULT_SOLVER_THREADS: usize = 6;
-const MAX_SOLVER_THREADS: usize = 256;
+const MAX_SOLVER_THREADS: usize = 1024;
+const MAX_CACHE_SHARDS: usize = 65_536;
 const CACHE_FILE: &str = "nim_light.cache";
 
-fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
-    let cache_shards = cache_shards_for_threads(threads);
+fn new_evaluator(threads: usize, cache_shards: usize) -> Arc<DfsSolver> {
     Arc::new(
         Evaluator::with_config(
             CanonicalMoveGenerator::new(PseudoCanonicalizer),
@@ -509,8 +533,30 @@ fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGa
                 KeyCode::Char('c') => editor.clear_cache(),
                 KeyCode::Char('S') => editor.save_cache(),
                 KeyCode::Char('L') => editor.load_cache(),
-                KeyCode::Char('[') => editor.adjust_solver_threads(-1),
-                KeyCode::Char(']') => editor.adjust_solver_threads(1),
+                KeyCode::Char('t') => {
+                    if let Some(threads) = prompt_usize(
+                        stdout,
+                        editor,
+                        "solver threads",
+                        editor.solver_threads,
+                        1,
+                        MAX_SOLVER_THREADS,
+                    )? {
+                        editor.set_solver_threads(threads);
+                    }
+                }
+                KeyCode::Char('s') => {
+                    if let Some(shards) = prompt_usize(
+                        stdout,
+                        editor,
+                        "cache shards",
+                        editor.cache_shards,
+                        1,
+                        MAX_CACHE_SHARDS,
+                    )? {
+                        editor.set_cache_shards(shards);
+                    }
+                }
                 KeyCode::Char('r') => editor.reset_demo(),
                 KeyCode::Char('o') => editor.reset_open(),
                 KeyCode::Char('+') | KeyCode::Char('=') => editor.resize(1, 0),
@@ -519,6 +565,52 @@ fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGa
                 KeyCode::Char('<') | KeyCode::Char(',') => editor.resize(0, -1),
                 KeyCode::Char('m') | KeyCode::Esc => return Ok(PostGame::Menu),
                 KeyCode::Char('q') => return Ok(PostGame::Quit),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn prompt_usize(
+    stdout: &mut impl Write,
+    editor: &Editor,
+    label: &str,
+    current: usize,
+    min: usize,
+    max: usize,
+) -> io::Result<Option<usize>> {
+    let mut input = current.to_string();
+    loop {
+        render_editor(stdout, editor, None)?;
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Yellow),
+            Print(format!(
+                "\r\nSet {label} ({min}..{max}); Enter apply, Esc cancel\r\n> {input}"
+            )),
+            ResetColor
+        )?;
+        stdout.flush()?;
+
+        if let Event::Key(key) = event::read()?
+            && is_press(key)
+        {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Ok(value) = input.parse::<usize>() {
+                        return Ok(Some(value.clamp(min, max)));
+                    }
+                }
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) if ch.is_ascii_digit() && !(input == "0" && ch == '0') => {
+                    if input == "0" {
+                        input.clear();
+                    }
+                    input.push(ch);
+                }
                 _ => {}
             }
         }
@@ -926,16 +1018,17 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "{}×{}  target: {}  nodes: {}  threads: {}  cache: {}\r\n",
+            "{}×{}  target: {}  nodes: {}  threads: {}  shards: {}  cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
             editor.maze.alive_count(),
             editor.solver_threads,
+            editor.cache_shards,
             editor.evaluator.cache_len()
         )),
         Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
-        Print("S save cache · L load cache · [/] threads · +/- rows · </> cols\r\n"),
+        Print("S save cache · L load cache · t threads · s shards · +/- rows · </> cols\r\n"),
         Print("r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 
