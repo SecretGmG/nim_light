@@ -1016,6 +1016,20 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
     let deferral_rate = stats.group_deferrals as f64 * 100.0 / busy;
     let forced_rate = stats.forced_duplicate_evaluations as f64 * 100.0 / busy;
     let resolved_rate = stats.deferred_resolved as f64 * 100.0 / busy;
+    let avg_active_workers = if stats.active_worker_samples == 0 {
+        0.0
+    } else {
+        stats.active_worker_sum as f64 / stats.active_worker_samples as f64
+    };
+    let groups = stats.successor_groups_started.max(1) as f64;
+    let avg_group_size = stats.successor_group_successors as f64 / groups;
+    let new_group_rate = stats.successor_groups_with_new_claim as f64 * 100.0 / groups;
+    let busy_group_rate = stats.successor_groups_with_busy as f64 * 100.0 / groups;
+    let revisit_busy_rate = if stats.group_revisits == 0 {
+        0.0
+    } else {
+        stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
+    };
     let estimated_bytes = if progress.estimated_cache_bytes == 0 && view.profile_age.is_none() {
         "~n/a".to_owned()
     } else if let Some(age) = view.profile_age {
@@ -1055,6 +1069,16 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             stats.group_deferrals,
             deferral_rate,
             stats.group_revisits
+        )),
+        Print(format!(
+            "workers avg {:.1} max {}  groups {} avg {:.1}  new {:.1}% busy {:.1}% revisit-busy {:.1}%\r\n",
+            avg_active_workers,
+            stats.max_active_workers,
+            stats.successor_groups_started,
+            avg_group_size,
+            new_group_rate,
+            busy_group_rate,
+            revisit_busy_rate
         )),
         Print(format!(
             "{:.0} eval/s  {:.0} unique/s  {:.0} hit/s  uptime {:.2?}\r\n",

@@ -137,6 +137,16 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
     }
 }
 
+fn canonicalization_suite(c: &mut Criterion) {
+    for (label, game) in canonicalization_benchmark_games() {
+        c.bench_function(&format!("canonicalize/{label}"), |bencher| {
+            bencher.iter(|| {
+                black_box(CanonicalGame::from_matrix(black_box(&game)));
+            });
+        });
+    }
+}
+
 fn new_evaluator() -> DfsSolver {
     new_evaluator_with_threads(8)
 }
@@ -268,6 +278,19 @@ fn labelled_benchmark_games() -> [(&'static str, BitMatrix); 4] {
     ]
 }
 
+fn canonicalization_benchmark_games() -> Vec<(&'static str, BitMatrix)> {
+    vec![
+        ("dense_5x5", dense_rectangle(5, 5)),
+        ("dense_7x7", dense_rectangle(7, 7)),
+        ("dense_10x10", dense_rectangle(10, 10)),
+        ("dense_3x7", dense_rectangle(3, 7)),
+        ("spiral_5x5", spiral_maze_game(5, 5)),
+        ("spiral_9x9", spiral_maze_game(9, 9)),
+        ("chambers_5x7", chambered_maze_game()),
+        ("chambers_9x11", chambered_maze_game_sized(9, 11)),
+    ]
+}
+
 fn benchmark_games() -> [BitMatrix; 4] {
     [
         dense_rectangle(5, 5),
@@ -305,18 +328,22 @@ fn spiral_maze_game(rows: usize, cols: usize) -> BitMatrix {
 }
 
 fn chambered_maze_game() -> BitMatrix {
-    let mut maze = Maze::open(5, 7);
+    chambered_maze_game_sized(5, 7)
+}
 
-    for row in 0..maze.rows() {
-        for col in [1, 4] {
-            if !matches!((row, col), (1, 1) | (3, 4)) {
+fn chambered_maze_game_sized(rows: usize, cols: usize) -> BitMatrix {
+    let mut maze = Maze::open(rows, cols);
+
+    for row in 0..rows {
+        for col in (1..cols.saturating_sub(1)).step_by(3) {
+            if row % 4 != 1 {
                 maze.add_vertical_wall(row, col);
             }
         }
     }
-    for row in [1, 3] {
-        for col in 0..maze.cols() {
-            if !matches!((row, col), (0, 0) | (1, 3) | (3, 6)) {
+    for row in (1..rows.saturating_sub(1)).step_by(3) {
+        for col in 0..cols {
+            if col % 4 != 2 {
                 maze.add_horizontal_wall(row, col);
             }
         }
@@ -386,4 +413,12 @@ criterion_group! {
         .measurement_time(Duration::from_secs(30));
     targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move
 }
-criterion_main!(benches);
+criterion_group! {
+    name = canonicalization_benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5));
+    targets = canonicalization_suite
+}
+criterion_main!(benches, canonicalization_benches);

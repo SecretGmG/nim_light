@@ -138,14 +138,26 @@ impl CanonicalGame {
 /// Deletes empty dimensions. Nonempty singleton dimensions are retained as
 /// the canonical two-incidence completion discussed in the solver design.
 fn remove_empty_dimensions(matrix: &BitMatrix) -> BitMatrix {
-    let rows: Vec<_> = (0..matrix.rows())
-        .filter(|&row| matrix.row_ones(row).next().is_some())
-        .collect();
+    let mut rows = Vec::new();
     let mut used_cols = vec![false; matrix.cols()];
-    for &row in &rows {
+    let mut used_col_count = 0;
+
+    for row in 0..matrix.rows() {
+        let mut row_is_used = false;
         for col in matrix.row_ones(row) {
-            used_cols[col] = true;
+            row_is_used = true;
+            if !used_cols[col] {
+                used_cols[col] = true;
+                used_col_count += 1;
+            }
         }
+        if row_is_used {
+            rows.push(row);
+        }
+    }
+
+    if rows.len() == matrix.rows() && used_col_count == matrix.cols() {
+        return matrix.clone();
     }
     let cols: Vec<_> = (0..matrix.cols()).filter(|&col| used_cols[col]).collect();
     matrix.reordered(&rows, &cols)
@@ -196,6 +208,10 @@ fn split_components(matrix: &BitMatrix) -> Vec<BitMatrix> {
             }
         }
 
+        if rows.len() == matrix.rows() && cols.len() == matrix.cols() {
+            return vec![matrix];
+        }
+
         rows.sort_unstable();
         cols.sort_unstable();
         result.push(matrix.reordered(&rows, &cols));
@@ -227,34 +243,37 @@ pub(crate) fn refine_colors(matrix: &BitMatrix) -> (Vec<usize>, Vec<usize>) {
     let mut previous_color_count = 0;
 
     loop {
-        let row_signatures: Vec<_> = (0..matrix.rows())
-            .map(|row| {
-                let mut neighbours: Vec<_> =
-                    matrix.row_ones(row).map(|col| col_colors[col]).collect();
-                neighbours.sort_unstable();
+        let mut indexed = Vec::with_capacity(matrix.rows() + matrix.cols());
+        for (row, &previous) in row_colors.iter().enumerate().take(matrix.rows()) {
+            let mut neighbours: Vec<_> = matrix.row_ones(row).map(|col| col_colors[col]).collect();
+            neighbours.sort_unstable();
+            indexed.push((
                 Signature {
                     side: 0,
-                    previous: row_colors[row],
+                    previous,
                     neighbours,
-                }
-            })
-            .collect();
-        let col_signatures: Vec<_> = (0..matrix.cols())
-            .map(|col| {
-                let mut neighbours: Vec<_> = transposed
-                    .row_ones(col)
-                    .map(|row| row_colors[row])
-                    .collect();
-                neighbours.sort_unstable();
+                },
+                Vertex::Row(row),
+            ));
+        }
+        for (col, &previous) in col_colors.iter().enumerate().take(matrix.cols()) {
+            let mut neighbours: Vec<_> = transposed
+                .row_ones(col)
+                .map(|row| row_colors[row])
+                .collect();
+            neighbours.sort_unstable();
+            indexed.push((
                 Signature {
                     side: 1,
-                    previous: col_colors[col],
+                    previous,
                     neighbours,
-                }
-            })
-            .collect();
+                },
+                Vertex::Col(col),
+            ));
+        }
 
-        let (new_rows, new_cols, color_count) = compress_signatures(row_signatures, col_signatures);
+        let (new_rows, new_cols, color_count) =
+            compress_indexed_signatures(indexed, matrix.rows(), matrix.cols());
         row_colors = new_rows;
         col_colors = new_cols;
 
@@ -265,25 +284,15 @@ pub(crate) fn refine_colors(matrix: &BitMatrix) -> (Vec<usize>, Vec<usize>) {
     }
 }
 
-fn compress_signatures(
-    rows: Vec<Signature>,
-    cols: Vec<Signature>,
+fn compress_indexed_signatures(
+    mut indexed: Vec<(Signature, Vertex)>,
+    row_count: usize,
+    col_count: usize,
 ) -> (Vec<usize>, Vec<usize>, usize) {
-    let row_count = rows.len();
-    let mut indexed: Vec<_> = rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, signature)| (signature, Vertex::Row(index)))
-        .chain(
-            cols.into_iter()
-                .enumerate()
-                .map(|(index, signature)| (signature, Vertex::Col(index))),
-        )
-        .collect();
-    indexed.sort_by(|left, right| left.0.cmp(&right.0));
+    indexed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     let mut row_colors = vec![0; row_count];
-    let mut col_colors = vec![0; indexed.len() - row_count];
+    let mut col_colors = vec![0; col_count];
     let mut color = 0;
     let mut previous: Option<&Signature> = None;
     for (signature, vertex) in &indexed {
@@ -344,6 +353,10 @@ fn refine_and_order(matrix: &BitMatrix) -> BitMatrix {
 }
 
 fn packed_row(matrix: &BitMatrix, row: usize, cols: &[usize]) -> Vec<u64> {
+    if cols.len() == matrix.cols() && is_identity_order(cols) {
+        return matrix.row_words(row).to_vec();
+    }
+
     let mut result = vec![0; cols.len().div_ceil(64)];
     for (new_col, &old_col) in cols.iter().enumerate() {
         if matrix.get(row, old_col) {
@@ -351,6 +364,13 @@ fn packed_row(matrix: &BitMatrix, row: usize, cols: &[usize]) -> Vec<u64> {
         }
     }
     result
+}
+
+fn is_identity_order(indices: &[usize]) -> bool {
+    indices
+        .iter()
+        .enumerate()
+        .all(|(expected, &actual)| expected == actual)
 }
 
 fn packed_col(matrix: &BitMatrix, col: usize, rows: &[usize]) -> Vec<u64> {

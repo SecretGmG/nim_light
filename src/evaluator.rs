@@ -86,6 +86,22 @@ pub struct EvaluatorStats {
     pub group_deferrals: usize,
     /// Deferred successor groups revisited after fresh groups were exhausted.
     pub group_revisits: usize,
+    /// Samples of active cooperative workers taken when a worker pulls a group.
+    pub active_worker_samples: usize,
+    /// Sum of active cooperative workers over `active_worker_samples`.
+    pub active_worker_sum: usize,
+    /// Maximum simultaneously active cooperative workers observed.
+    pub max_active_workers: usize,
+    /// Successor groups entered by any evaluator path.
+    pub successor_groups_started: usize,
+    /// Canonical successors contained in entered groups.
+    pub successor_group_successors: usize,
+    /// Successor groups that claimed at least one new position.
+    pub successor_groups_with_new_claim: usize,
+    /// Successor groups that encountered at least one busy position.
+    pub successor_groups_with_busy: usize,
+    /// Revisited deferred groups that were still busy.
+    pub successor_revisit_groups_with_busy: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -116,6 +132,15 @@ struct AtomicEvaluatorStats {
     cooperative_group_pulls: AtomicUsize,
     group_deferrals: AtomicUsize,
     group_revisits: AtomicUsize,
+    active_workers: AtomicUsize,
+    active_worker_samples: AtomicUsize,
+    active_worker_sum: AtomicUsize,
+    max_active_workers: AtomicUsize,
+    successor_groups_started: AtomicUsize,
+    successor_group_successors: AtomicUsize,
+    successor_groups_with_new_claim: AtomicUsize,
+    successor_groups_with_busy: AtomicUsize,
+    successor_revisit_groups_with_busy: AtomicUsize,
 }
 
 impl AtomicEvaluatorStats {
@@ -134,7 +159,53 @@ impl AtomicEvaluatorStats {
             cooperative_group_pulls: self.cooperative_group_pulls.load(Ordering::Relaxed),
             group_deferrals: self.group_deferrals.load(Ordering::Relaxed),
             group_revisits: self.group_revisits.load(Ordering::Relaxed),
+            active_worker_samples: self.active_worker_samples.load(Ordering::Relaxed),
+            active_worker_sum: self.active_worker_sum.load(Ordering::Relaxed),
+            max_active_workers: self.max_active_workers.load(Ordering::Relaxed),
+            successor_groups_started: self.successor_groups_started.load(Ordering::Relaxed),
+            successor_group_successors: self.successor_group_successors.load(Ordering::Relaxed),
+            successor_groups_with_new_claim: self
+                .successor_groups_with_new_claim
+                .load(Ordering::Relaxed),
+            successor_groups_with_busy: self.successor_groups_with_busy.load(Ordering::Relaxed),
+            successor_revisit_groups_with_busy: self
+                .successor_revisit_groups_with_busy
+                .load(Ordering::Relaxed),
         }
+    }
+
+    fn observe_active_workers(&self, active: usize) {
+        self.active_worker_samples.fetch_add(1, Ordering::Relaxed);
+        self.active_worker_sum.fetch_add(active, Ordering::Relaxed);
+        let mut previous = self.max_active_workers.load(Ordering::Relaxed);
+        while active > previous {
+            match self.max_active_workers.compare_exchange_weak(
+                previous,
+                active,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => previous = current,
+            }
+        }
+    }
+
+    fn flush_distribution(&self, distribution: DistributionStats) {
+        self.successor_groups_started
+            .fetch_add(distribution.successor_groups_started, Ordering::Relaxed);
+        self.successor_group_successors
+            .fetch_add(distribution.successor_group_successors, Ordering::Relaxed);
+        self.successor_groups_with_new_claim.fetch_add(
+            distribution.successor_groups_with_new_claim,
+            Ordering::Relaxed,
+        );
+        self.successor_groups_with_busy
+            .fetch_add(distribution.successor_groups_with_busy, Ordering::Relaxed);
+        self.successor_revisit_groups_with_busy.fetch_add(
+            distribution.successor_revisit_groups_with_busy,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -561,11 +632,7 @@ where
         cancel: &Arc<AtomicBool>,
     ) -> Option<usize> {
         let game = self.generator.canonicalize(matrix.clone());
-        let nimber = self.nimber_of_canonical_cancellable(&game, cancel);
-        if nimber.is_none() {
-            self.cache.clear_processing();
-        }
-        nimber
+        self.nimber_of_canonical_cancellable(&game, cancel)
     }
 
     pub fn nimber_of_canonical(&self, game: &CanonicalGame) -> usize {
@@ -683,7 +750,7 @@ where
             return None;
         }
         match self.try_nimber(game, cancel)? {
-            Evaluation::Ready(nimber) => nimber,
+            Evaluation::Ready { nimber, .. } => nimber,
             Evaluation::Busy => {
                 if let Some(nimber) = self.cache.get_done(game) {
                     self.stats
@@ -746,7 +813,10 @@ where
             return None;
         }
         if game.is_empty() {
-            return Some(Evaluation::Ready(0));
+            return Some(Evaluation::Ready {
+                nimber: 0,
+                claimed: false,
+            });
         }
 
         Some(match self.cache.probe(game) {
@@ -754,7 +824,10 @@ where
                 self.stats
                     .completed_cache_hits
                     .fetch_add(1, Ordering::Relaxed);
-                Evaluation::Ready(nimber)
+                Evaluation::Ready {
+                    nimber,
+                    claimed: false,
+                }
             }
             CacheProbe::Busy => {
                 self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
@@ -769,7 +842,10 @@ where
                     .fetch_add(1, Ordering::Relaxed);
                 let nimber = self.compute_position(game, cancel)?;
                 self.cache_result(game.clone(), nimber);
-                Evaluation::Ready(nimber)
+                Evaluation::Ready {
+                    nimber,
+                    claimed: true,
+                }
             }
         })
     }
@@ -852,6 +928,7 @@ where
             &mut worker,
             cancel,
         );
+        self.stats.flush_distribution(worker.distribution);
         if worker.cancelled {
             return None;
         }
@@ -890,6 +967,7 @@ where
             for _ in 0..worker_count {
                 scope.spawn(|_| {
                     let mut local = WorkerResult::new(bound);
+                    let worker_seed = rayon::current_thread_index().unwrap_or(0);
                     loop {
                         if is_cancelled(cancel) {
                             local.cancelled = true;
@@ -901,6 +979,9 @@ where
                         self.stats
                             .cooperative_group_pulls
                             .fetch_add(1, Ordering::Relaxed);
+                        let active_workers =
+                            self.stats.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.stats.observe_active_workers(active_workers);
                         let mut deferred = Vec::new();
                         self.evaluate_successor_group_vec_with_deferral(
                             group.into_iter().collect(),
@@ -909,19 +990,8 @@ where
                             DeferMode::Fresh,
                             cancel,
                         );
-                        for deferred_group in deferred {
-                            self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
-                            self.evaluate_successor_group_vec_with_deferral(
-                                deferred_group,
-                                &mut local,
-                                &mut Vec::new(),
-                                DeferMode::Revisit,
-                                cancel,
-                            );
-                            if local.cancelled {
-                                break;
-                            }
-                        }
+                        self.revisit_deferred_groups(deferred, &mut local, worker_seed, cancel);
+                        self.stats.active_workers.fetch_sub(1, Ordering::Relaxed);
                         if local.cancelled {
                             break;
                         }
@@ -931,11 +1001,13 @@ where
                     result.cancelled |= local.cancelled;
                     result.reachable.union_with(&local.reachable);
                     result.pending.extend(local.pending);
+                    result.distribution.merge(local.distribution);
                 });
             }
         });
 
         let mut result = result.into_inner().expect("root result poisoned");
+        self.stats.flush_distribution(result.distribution);
         self.resolve_pending(&mut result, cancel);
         if result.cancelled {
             return None;
@@ -965,6 +1037,23 @@ where
                 return;
             }
         }
+        self.revisit_deferred_groups(
+            deferred,
+            worker,
+            self.pool.current_thread_index().unwrap_or(0),
+            cancel,
+        );
+        self.resolve_pending(worker, cancel);
+    }
+
+    fn revisit_deferred_groups(
+        &self,
+        mut deferred: Vec<Vec<CanonicalGame>>,
+        worker: &mut WorkerResult,
+        seed: usize,
+        cancel: Option<&AtomicBool>,
+    ) {
+        rotate_deferred_groups(&mut deferred, seed);
         for group in deferred {
             self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
             self.evaluate_successor_group_vec_with_deferral(
@@ -978,7 +1067,6 @@ where
                 return;
             }
         }
-        self.resolve_pending(worker, cancel);
     }
 
     fn evaluate_successor_group_vec_with_deferral(
@@ -989,28 +1077,56 @@ where
         mode: DeferMode,
         cancel: Option<&AtomicBool>,
     ) {
+        let successor_count = successors.len();
+        let mut had_new_claim = false;
+        let mut had_busy = false;
+        let mut revisit_busy = false;
         for (index, successor) in successors.iter().enumerate() {
             if is_cancelled(cancel) {
                 worker.cancelled = true;
+                worker.record_successor_group(
+                    successor_count,
+                    had_new_claim,
+                    had_busy,
+                    revisit_busy,
+                );
                 return;
             }
             match self.try_nimber(successor, cancel) {
-                Some(Evaluation::Ready(nimber)) => worker.reachable.insert(nimber),
+                Some(Evaluation::Ready { nimber, claimed }) => {
+                    had_new_claim |= claimed;
+                    worker.reachable.insert(nimber);
+                }
                 Some(Evaluation::Busy) => {
+                    had_busy = true;
                     if mode == DeferMode::Fresh {
                         self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
                         deferred.push(successors[index..].to_vec());
+                        worker.record_successor_group(
+                            successor_count,
+                            had_new_claim,
+                            had_busy,
+                            revisit_busy,
+                        );
                         return;
                     } else {
+                        revisit_busy = true;
                         worker.pending.push(successor.clone());
                     }
                 }
                 None => {
                     worker.cancelled = true;
+                    worker.record_successor_group(
+                        successor_count,
+                        had_new_claim,
+                        had_busy,
+                        revisit_busy,
+                    );
                     return;
                 }
             }
         }
+        worker.record_successor_group(successor_count, had_new_claim, had_busy, revisit_busy);
     }
 
     fn resolve_pending(&self, worker: &mut WorkerResult, cancel: Option<&AtomicBool>) {
@@ -1056,7 +1172,7 @@ where
 
 #[derive(Clone, Copy)]
 enum Evaluation {
-    Ready(usize),
+    Ready { nimber: usize, claimed: bool },
     Busy,
 }
 
@@ -1066,9 +1182,16 @@ enum DeferMode {
     Revisit,
 }
 
+fn rotate_deferred_groups(deferred: &mut [Vec<CanonicalGame>], seed: usize) {
+    if !deferred.is_empty() {
+        deferred.rotate_left(seed % deferred.len());
+    }
+}
+
 struct WorkerResult {
     reachable: NimberSet,
     pending: Vec<CanonicalGame>,
+    distribution: DistributionStats,
     cancelled: bool,
 }
 
@@ -1077,8 +1200,42 @@ impl WorkerResult {
         Self {
             reachable: NimberSet::new(bit_count),
             pending: Vec::new(),
+            distribution: DistributionStats::default(),
             cancelled: false,
         }
+    }
+
+    fn record_successor_group(
+        &mut self,
+        successor_count: usize,
+        had_new_claim: bool,
+        had_busy: bool,
+        revisit_busy: bool,
+    ) {
+        self.distribution.successor_groups_started += 1;
+        self.distribution.successor_group_successors += successor_count;
+        self.distribution.successor_groups_with_new_claim += usize::from(had_new_claim);
+        self.distribution.successor_groups_with_busy += usize::from(had_busy);
+        self.distribution.successor_revisit_groups_with_busy += usize::from(revisit_busy);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DistributionStats {
+    successor_groups_started: usize,
+    successor_group_successors: usize,
+    successor_groups_with_new_claim: usize,
+    successor_groups_with_busy: usize,
+    successor_revisit_groups_with_busy: usize,
+}
+
+impl DistributionStats {
+    fn merge(&mut self, other: Self) {
+        self.successor_groups_started += other.successor_groups_started;
+        self.successor_group_successors += other.successor_group_successors;
+        self.successor_groups_with_new_claim += other.successor_groups_with_new_claim;
+        self.successor_groups_with_busy += other.successor_groups_with_busy;
+        self.successor_revisit_groups_with_busy += other.successor_revisit_groups_with_busy;
     }
 }
 
@@ -1333,11 +1490,35 @@ mod tests {
         }
 
         let stats = evaluator.stats();
+        let avg_active_workers = if stats.active_worker_samples == 0 {
+            0.0
+        } else {
+            stats.active_worker_sum as f64 / stats.active_worker_samples as f64
+        };
+        let groups = stats.successor_groups_started.max(1) as f64;
+        let avg_group_size = stats.successor_group_successors as f64 / groups;
+        let new_group_rate = stats.successor_groups_with_new_claim as f64 * 100.0 / groups;
+        let busy_group_rate = stats.successor_groups_with_busy as f64 * 100.0 / groups;
+        let revisit_busy_rate = if stats.group_revisits == 0 {
+            0.0
+        } else {
+            stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
+        };
         println!(
             "\ntotal seconds: {:.3}",
             suite_start.elapsed().as_secs_f64()
         );
         println!("final cache entries: {}", evaluator.cache_len());
+        println!(
+            "distribution: avg_active {:.2}  max_active {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
+            avg_active_workers,
+            stats.max_active_workers,
+            stats.successor_groups_started,
+            avg_group_size,
+            new_group_rate,
+            busy_group_rate,
+            revisit_busy_rate,
+        );
         println!("final stats: {stats:#?}");
         assert_eq!(
             stats.evaluation_attempts,

@@ -122,6 +122,77 @@ Criterion did not show a statistically significant improvement, so this should
 be treated primarily as a conservative cap/simplification rather than a proven
 large win.
 
+### Canonicalization compact-component fast returns
+
+`remove_empty_dimensions` now returns the original compact matrix clone as soon
+as it knows all rows and columns are used. It also tracks the used column count
+while scanning, so it no longer builds the retained-column vector in the common
+already-compact case.
+
+`split_components` also returns the compact matrix directly when the first
+graph search proves that the position is a single connected component. This
+avoids sorting identity row/column lists and rebuilding the same matrix.
+
+These changes are semantic no-ops and were retained. They mostly help the
+canonicalization-only benchmark on connected/compact games and are neutral
+elsewhere.
+
+### `BitMatrix::reordered` identity and row-only paths
+
+`BitMatrix::reordered` now handles two common cases before falling back to
+bit-by-bit reconstruction:
+
+- full identity reorder: clone the matrix;
+- identity columns: copy selected packed row words directly.
+
+This is useful because canonicalization frequently asks for identity or
+row-only reorders while evaluating candidate orderings. The row-only path is
+also generally useful outside canonicalization.
+
+Retained. It gives a clear dense-grid win and was neutral on the larger maze
+cases after avoiding repeated identity scans.
+
+### Identity-column row packing
+
+`packed_row` now copies the existing packed row words directly when the column
+order is still the identity order. This avoids bit-by-bit repacking in the
+first ordering round and in cases where the column order stabilizes at identity.
+
+Retained as a small local optimization. The benchmark effect was mixed in
+isolation but positive in the retained combined variant, especially on the
+larger maze cases.
+
+### Direct indexed WL signature list
+
+`refine_colors` now builds the sortable `(Signature, Vertex)` list directly
+instead of allocating separate row and column signature vectors and then
+chaining them into a third vector. This keeps the same color-refinement
+semantics but removes two intermediate vectors per WL round.
+
+The signature list also uses `sort_unstable_by`, because equal signatures get
+the same color and their relative order is irrelevant.
+
+Retained. This was mixed on the smallest maze cases but improved most of the
+canonicalization benchmark, especially larger maze-like positions.
+
+Latest representative medians versus the original canonicalization benchmark:
+
+```text
+game             original     current      change
+dense 5x5          9.89 us     8.48 us     -14%
+dense 7x7         16.32 us    14.15 us     -13%
+dense 10x10       36.25 us    32.09 us     -11%
+dense 3x7          8.50 us     7.41 us     -13%
+spiral 5x5        33.25 us    34.43 us      +4%
+spiral 9x9       192.23 us   163.26 us     -15%
+chambers 5x7      31.14 us    29.52 us      -5%
+chambers 9x11    158.57 us   145.22 us      -8%
+```
+
+The small `spiral_5x5` regression is currently accepted because the larger
+maze-like cases and all dense cases improved. This should be rechecked if the
+interactive editor workload turns out to be dominated by tiny sparse mazes.
+
 ## Rejected / not retained variants
 
 ### Full column-bit-pattern grouping in move generation
@@ -175,6 +246,95 @@ Reducing `refine_and_order` to `8` or `4` rounds was worse than the retained
 
 Conclusion: keep the `16` cap for now.
 
+### Canonicalization lazy transpose view and scratch packing
+
+I added a focused Criterion benchmark for canonicalization-only work:
+
+```sh
+cargo bench --bench shared_cache -- canonicalize
+```
+
+The suite includes dense grids, spiral mazes, and chamber mazes up to sizes
+where computing the full nimber would be unnecessary for this microbenchmark.
+
+Two canonicalizer variants were tested and rejected:
+
+1. Lazy transpose view.
+   This avoided allocating `component.transposed()` by routing every access
+   through an orientation flag.
+
+2. Scratch-packed permutation refinement.
+   This kept row/column permutation maps during refinement and used reusable
+   flat `u64` arenas instead of allocating one small `Vec<u64>` per packed row
+   or column.
+
+The lazy transpose view was clearly bad for sparse maze-like positions. It
+saved one transposed matrix allocation, but replaced it with repeated indirect
+access and, more importantly, scans over the wrong logical dimension. The
+larger sparse benchmarks regressed substantially.
+
+The scratch/permutation-only variant was mostly neutral and noisy. A
+representative median comparison against the original implementation:
+
+```text
+game             original     scratch/permutation
+dense 5x5          9.89 us        10.06 us
+dense 7x7         16.32 us        16.86 us
+dense 10x10       36.25 us        36.18 us
+dense 3x7          8.50 us         8.60 us
+spiral 5x5        33.25 us        32.96 us
+spiral 9x9       192.23 us       197.63 us
+chambers 5x7      31.14 us        30.70 us
+chambers 9x11    158.57 us       174.58 us
+```
+
+Conclusion: fully reverted. Candidate matrix materialization and per-row
+packed-vector allocation are not currently the dominant canonicalization costs.
+The existing direct implementation is simpler and at least as fast in practice.
+
+### WL color-histogram signatures
+
+I tested replacing sorted neighbor-color lists with sorted `(color, count)`
+histograms. This is semantically equivalent for WL refinement and looked
+plausible for dense regular boards where many neighbor colors repeat.
+
+It regressed across the benchmark:
+
+```text
+game             histogram result
+dense 5x5        +15%
+dense 7x7        +11%
+dense 10x10       +8%
+dense 3x7        +18%
+spiral 5x5       +26%
+spiral 9x9       +13%
+chambers 5x7     +22%
+chambers 9x11    noisy / no clear win
+```
+
+Rejected. The extra compression work and pair comparisons cost more than the
+shorter signatures save at these board sizes.
+
+Implications for future canonicalization work:
+
+1. Target WL signature construction first.
+   The remaining hot path is likely building, sorting, and compressing
+   neighbor-color signatures, not final candidate materialization.
+
+2. Measure before changing representation.
+   Add direct counters/timers for `canonicalize`, `split_components`,
+   `refine_colors`, and `refine_and_order`. Solver-level throughput is too
+   indirect for canonicalizer work.
+
+3. Consider reusable signature storage.
+   If profiling confirms WL allocation cost, reuse neighbor/color buffers per
+   refinement round instead of allocating nested `Vec<usize>` signatures.
+
+4. Improve cache quality only inside unresolved WL classes.
+   A bounded exact ordering search over small color classes may be more valuable
+   than making the current heuristic loop marginally faster, because better
+   canonical collapse can reduce the number of evaluated states.
+
 ### Parallel depth 1
 
 Reducing parallel depth from `2` to `1` was slower in the tested benchmark.
@@ -212,6 +372,78 @@ the reachable nimber set is sufficient.
    This is still the most plausible cache-quality improvement.
 3. Add solver metrics for generated successor count versus unique claimed
    positions. This would make move-generator tradeoffs less indirect.
+
+## Evaluator distribution baseline
+
+Command:
+
+```sh
+cargo test --release shared_cache_benchmark_suite -- --ignored --nocapture --test-threads=1
+```
+
+Current 8-thread release diagnostic baseline:
+
+```text
+game          matrix     nodes  nimber  seconds  cache  attempts  hits     unique  forced  sym
+dense 5x5       5x5       25       0    1.086   2992      3007   168779    2992      15    15
+dense 3x7       3x7       21       6    0.474   3510      3525   203923    3510      15    18
+spiral 5x5     11x15      25       8    1.576  44050     44617   716163   44050     567    18
+chambers 5x7   13x19      35       5   22.495  93105     93672  2012328   93105     567    24
+
+total seconds: 25.631
+```
+
+Final distribution metrics:
+
+```text
+avg_active_workers:          5.43 / 8  (~67.9% sampled utilization)
+max_active_workers:          8
+active_worker_samples:       21
+cooperative_regions:         3
+cooperative_group_pulls:     21
+
+successor_groups_started:    428275
+successor_group_successors:  1992789
+avg_group_size:              4.65
+groups_with_new_claim:       53374   (12.5%)
+groups_with_busy:            4449    (1.0%)
+
+processing_hits:             5064    (5.4% of unique positions)
+group_deferrals:             3082
+group_revisits:              3082
+revisit_groups_still_busy:   1367    (44.4% of revisits)
+deferred_resolved:           1415    (45.9% of deferrals)
+forced_duplicate_evals:       567    (0.6% of unique positions)
+duplicate_publish_races:      567
+```
+
+Interpretation:
+
+- The cooperative root layer does fill all 8 workers at peak, but the sampled
+  average is only about 5.4 active workers. The sample count is low because
+  samples are taken per cooperative group pull, so this is a coarse signal, not
+  a precise utilization integral.
+- Only about 12.5% of successor groups claim new work. Most groups are cache
+  probes / already-known nimber propagation.
+- Busy groups are rare overall (1.0%), but when a deferred group is revisited,
+  44.4% are still busy. Deferral often helps, but collision on the same branch
+  remains substantial.
+- Forced duplicate evaluation is low relative to unique positions (0.6%), so
+  the current scheduler is not losing most time by fully recomputing busy
+  states. The larger cost appears to be traversing many cache-heavy successor
+  groups and maintaining enough useful frontier work.
+
+Next evaluator/scheduler questions:
+
+1. Replace coarse active-worker sampling with a time-weighted active-worker
+   integral if we need accurate utilization.
+2. Measure group productivity by depth. The current metrics say many groups do
+   not claim new work, but not where in the tree this happens.
+3. Try reducing low-productivity group traversal: if a group prefix is mostly
+   cache hits and then a busy state, defer earlier or prioritize a different
+   group shape.
+4. Investigate why `chambers_5x7` dominates the suite. It has many small groups
+   and a high cache-hit volume; this may be the best scheduler benchmark.
 
 ## Notes for very long computations
 

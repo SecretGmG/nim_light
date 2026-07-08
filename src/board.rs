@@ -177,6 +177,21 @@ impl BitMatrix {
         assert!(rows.iter().all(|&row| row < self.rows));
         assert!(cols.iter().all(|&col| col < self.cols));
 
+        let rows_identity = rows.len() == self.rows && is_identity(rows);
+        let cols_identity = cols.len() == self.cols && is_identity(cols);
+
+        if rows_identity && cols_identity {
+            return self.clone();
+        }
+
+        if cols_identity {
+            let mut data = Vec::with_capacity(rows.len() * self.words_per_row);
+            for &row in rows {
+                data.extend_from_slice(self.row_words(row));
+            }
+            return Self::from_words(rows.len(), self.cols, data);
+        }
+
         let mut result = Self::new(rows.len(), cols.len());
         for (new_row, &old_row) in rows.iter().enumerate() {
             for (new_col, &old_col) in cols.iter().enumerate() {
@@ -197,6 +212,13 @@ impl BitMatrix {
         }
         result
     }
+}
+
+fn is_identity(indices: &[usize]) -> bool {
+    indices
+        .iter()
+        .enumerate()
+        .all(|(expected, &actual)| expected == actual)
 }
 
 impl Hash for BitMatrix {
