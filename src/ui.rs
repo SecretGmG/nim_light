@@ -1063,9 +1063,10 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             stats.symmetry_zero_certificates
         )),
         Print(format!(
-            "coop regions {}  group pulls {}  deferrals {} ({:.1}% of busy)  revisits {}\r\n",
+            "coop regions {}  workers {}  descents {}  deferrals {} ({:.1}% of busy)  revisits {}\r\n",
             stats.cooperative_regions,
-            stats.cooperative_group_pulls,
+            stats.cooperative_worker_entries,
+            stats.deferred_descents,
             stats.group_deferrals,
             deferral_rate,
             stats.group_revisits

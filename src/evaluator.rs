@@ -80,8 +80,12 @@ pub struct EvaluatorStats {
     pub symmetry_zero_certificates: usize,
     /// Cooperative root/component fanout regions opened.
     pub cooperative_regions: usize,
-    /// Successor groups pulled by cooperative workers.
+    /// Successor groups pulled by legacy cooperative workers.
     pub cooperative_group_pulls: usize,
+    /// Worker entries into the recursive cooperative evaluator.
+    pub cooperative_worker_entries: usize,
+    /// Revisited busy positions entered recursively instead of only forced at the leaf.
+    pub deferred_descents: usize,
     /// Successor groups deferred because a busy successor was encountered.
     pub group_deferrals: usize,
     /// Deferred successor groups revisited after fresh groups were exhausted.
@@ -130,6 +134,8 @@ struct AtomicEvaluatorStats {
     symmetry_zero_certificates: AtomicUsize,
     cooperative_regions: AtomicUsize,
     cooperative_group_pulls: AtomicUsize,
+    cooperative_worker_entries: AtomicUsize,
+    deferred_descents: AtomicUsize,
     group_deferrals: AtomicUsize,
     group_revisits: AtomicUsize,
     active_workers: AtomicUsize,
@@ -157,6 +163,8 @@ impl AtomicEvaluatorStats {
             symmetry_zero_certificates: self.symmetry_zero_certificates.load(Ordering::Relaxed),
             cooperative_regions: self.cooperative_regions.load(Ordering::Relaxed),
             cooperative_group_pulls: self.cooperative_group_pulls.load(Ordering::Relaxed),
+            cooperative_worker_entries: self.cooperative_worker_entries.load(Ordering::Relaxed),
+            deferred_descents: self.deferred_descents.load(Ordering::Relaxed),
             group_deferrals: self.group_deferrals.load(Ordering::Relaxed),
             group_revisits: self.group_revisits.load(Ordering::Relaxed),
             active_worker_samples: self.active_worker_samples.load(Ordering::Relaxed),
@@ -749,7 +757,7 @@ where
         if is_cancelled(cancel) {
             return None;
         }
-        match self.try_nimber(game, cancel)? {
+        match self.try_nimber(game, cancel, EvaluationPolicy::Serial)? {
             Evaluation::Ready { nimber, .. } => nimber,
             Evaluation::Busy => {
                 if let Some(nimber) = self.cache.get_done(game) {
@@ -808,7 +816,12 @@ where
         })
     }
 
-    fn try_nimber(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<Evaluation> {
+    fn try_nimber(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
+    ) -> Option<Evaluation> {
         if is_cancelled(cancel) {
             return None;
         }
@@ -840,7 +853,7 @@ where
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
-                let nimber = self.compute_position(game, cancel)?;
+                let nimber = self.compute_position(game, cancel, policy)?;
                 self.cache_result(game.clone(), nimber);
                 Evaluation::Ready {
                     nimber,
@@ -850,14 +863,19 @@ where
         })
     }
 
-    fn compute_position(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<usize> {
+    fn compute_position(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
+    ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
         if game.components().len() > 1 {
-            self.nimber_of_components(game, cancel)
+            self.nimber_of_components(game, cancel, policy)
         } else {
-            self.nimber_of_component(&game.components()[0], cancel)
+            self.nimber_of_component(&game.components()[0], cancel, policy)
         }
     }
 
@@ -870,7 +888,7 @@ where
             return None;
         }
         if game.components().len() > 1 {
-            return self.nimber_of_components(game, cancel);
+            return self.nimber_of_components(game, cancel, EvaluationPolicy::Serial);
         }
         self.nimber_of_component_cooperative_root(&game.components()[0], cancel)
     }
@@ -879,6 +897,15 @@ where
         &self,
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
+    ) -> Option<usize> {
+        self.evaluate_duplicate_with_policy(game, cancel, EvaluationPolicy::Serial)
+    }
+
+    fn evaluate_duplicate_with_policy(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
@@ -889,7 +916,7 @@ where
         self.stats
             .evaluation_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let nimber = self.compute_position(game, cancel)?;
+        let nimber = self.compute_position(game, cancel, policy)?;
         self.cache_result(game.clone(), nimber);
         Some(nimber)
     }
@@ -898,10 +925,23 @@ where
         &self,
         game: &CanonicalGame,
         cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
     ) -> Option<usize> {
         let mut nimber = 0;
         for index in 0..game.components().len() {
-            nimber ^= self.nimber_inner(&game.component(index), cancel)?;
+            let component = game.component(index);
+            nimber ^= match policy {
+                EvaluationPolicy::Serial => self.nimber_inner(&component, cancel)?,
+                EvaluationPolicy::CooperativeAssist => {
+                    match self.try_nimber(&component, cancel, policy)? {
+                        Evaluation::Ready { nimber, .. } => nimber,
+                        Evaluation::Busy => {
+                            self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
+                            self.evaluate_duplicate_with_policy(&component, cancel, policy)?
+                        }
+                    }
+                }
+            };
         }
         Some(nimber)
     }
@@ -910,6 +950,7 @@ where
         &self,
         component: &BitMatrix,
         cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
@@ -926,6 +967,7 @@ where
         self.evaluate_successor_groups(
             self.generator.successor_groups(component),
             &mut worker,
+            policy,
             cancel,
         );
         self.stats.flush_distribution(worker.distribution);
@@ -951,11 +993,6 @@ where
         }
 
         let bound = component.count_ones() + 1;
-        let groups = Mutex::new(
-            self.generator
-                .successor_groups(component)
-                .collect::<Vec<_>>(),
-        );
         let result = Mutex::new(WorkerResult::new(bound));
         let worker_count = self.pool.current_num_threads().max(1);
 
@@ -968,34 +1005,20 @@ where
                 scope.spawn(|_| {
                     let mut local = WorkerResult::new(bound);
                     let worker_seed = rayon::current_thread_index().unwrap_or(0);
-                    loop {
-                        if is_cancelled(cancel) {
-                            local.cancelled = true;
-                            break;
-                        }
-                        let Some(group) = groups.lock().expect("root groups poisoned").pop() else {
-                            break;
-                        };
-                        self.stats
-                            .cooperative_group_pulls
-                            .fetch_add(1, Ordering::Relaxed);
-                        let active_workers =
-                            self.stats.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
-                        self.stats.observe_active_workers(active_workers);
-                        let mut deferred = Vec::new();
-                        self.evaluate_successor_group_vec_with_deferral(
-                            group.into_iter().collect(),
-                            &mut local,
-                            &mut deferred,
-                            DeferMode::Fresh,
-                            cancel,
-                        );
-                        self.revisit_deferred_groups(deferred, &mut local, worker_seed, cancel);
-                        self.stats.active_workers.fetch_sub(1, Ordering::Relaxed);
-                        if local.cancelled {
-                            break;
-                        }
-                    }
+                    self.stats
+                        .cooperative_worker_entries
+                        .fetch_add(1, Ordering::Relaxed);
+                    let active_workers =
+                        self.stats.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.stats.observe_active_workers(active_workers);
+                    self.evaluate_successor_groups_with_seed(
+                        self.generator.successor_groups(component),
+                        &mut local,
+                        EvaluationPolicy::CooperativeAssist,
+                        worker_seed,
+                        cancel,
+                    );
+                    self.stats.active_workers.fetch_sub(1, Ordering::Relaxed);
 
                     let mut result = result.lock().expect("root result poisoned");
                     result.cancelled |= local.cancelled;
@@ -1019,6 +1042,27 @@ where
         &self,
         groups: I,
         worker: &mut WorkerResult,
+        policy: EvaluationPolicy,
+        cancel: Option<&AtomicBool>,
+    ) where
+        I: IntoIterator<Item = H>,
+        H: IntoIterator<Item = CanonicalGame>,
+    {
+        self.evaluate_successor_groups_with_seed(
+            groups,
+            worker,
+            policy,
+            self.pool.current_thread_index().unwrap_or(0),
+            cancel,
+        );
+    }
+
+    fn evaluate_successor_groups_with_seed<I, H>(
+        &self,
+        groups: I,
+        worker: &mut WorkerResult,
+        policy: EvaluationPolicy,
+        seed: usize,
         cancel: Option<&AtomicBool>,
     ) where
         I: IntoIterator<Item = H>,
@@ -1030,6 +1074,7 @@ where
                 group.into_iter().collect(),
                 worker,
                 &mut deferred,
+                policy,
                 DeferMode::Fresh,
                 cancel,
             );
@@ -1037,12 +1082,7 @@ where
                 return;
             }
         }
-        self.revisit_deferred_groups(
-            deferred,
-            worker,
-            self.pool.current_thread_index().unwrap_or(0),
-            cancel,
-        );
+        self.revisit_deferred_groups(deferred, worker, policy, seed, cancel);
         self.resolve_pending(worker, cancel);
     }
 
@@ -1050,6 +1090,7 @@ where
         &self,
         mut deferred: Vec<Vec<CanonicalGame>>,
         worker: &mut WorkerResult,
+        policy: EvaluationPolicy,
         seed: usize,
         cancel: Option<&AtomicBool>,
     ) {
@@ -1060,6 +1101,7 @@ where
                 group,
                 worker,
                 &mut Vec::new(),
+                policy,
                 DeferMode::Revisit,
                 cancel,
             );
@@ -1074,6 +1116,7 @@ where
         successors: Vec<CanonicalGame>,
         worker: &mut WorkerResult,
         deferred: &mut Vec<Vec<CanonicalGame>>,
+        policy: EvaluationPolicy,
         mode: DeferMode,
         cancel: Option<&AtomicBool>,
     ) {
@@ -1092,7 +1135,7 @@ where
                 );
                 return;
             }
-            match self.try_nimber(successor, cancel) {
+            match self.try_nimber(successor, cancel, policy) {
                 Some(Evaluation::Ready { nimber, claimed }) => {
                     had_new_claim |= claimed;
                     worker.reachable.insert(nimber);
@@ -1111,7 +1154,33 @@ where
                         return;
                     } else {
                         revisit_busy = true;
-                        worker.pending.push(successor.clone());
+                        match policy {
+                            EvaluationPolicy::Serial => worker.pending.push(successor.clone()),
+                            EvaluationPolicy::CooperativeAssist => {
+                                self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
+                                if let Some(nimber) = self.cache.get_done(successor) {
+                                    self.stats
+                                        .completed_cache_hits
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
+                                    worker.reachable.insert(nimber);
+                                } else {
+                                    let Some(nimber) = self
+                                        .evaluate_duplicate_with_policy(successor, cancel, policy)
+                                    else {
+                                        worker.cancelled = true;
+                                        worker.record_successor_group(
+                                            successor_count,
+                                            had_new_claim,
+                                            had_busy,
+                                            revisit_busy,
+                                        );
+                                        return;
+                                    };
+                                    worker.reachable.insert(nimber);
+                                }
+                            }
+                        }
                     }
                 }
                 None => {
@@ -1174,6 +1243,12 @@ where
 enum Evaluation {
     Ready { nimber: usize, claimed: bool },
     Busy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvaluationPolicy {
+    Serial,
+    CooperativeAssist,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1510,9 +1585,11 @@ mod tests {
         );
         println!("final cache entries: {}", evaluator.cache_len());
         println!(
-            "distribution: avg_active {:.2}  max_active {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
+            "distribution: avg_active {:.2}  max_active {}  workers {}  descents {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
             avg_active_workers,
             stats.max_active_workers,
+            stats.cooperative_worker_entries,
+            stats.deferred_descents,
             stats.successor_groups_started,
             avg_group_size,
             new_group_rate,
