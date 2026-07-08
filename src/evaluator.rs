@@ -47,11 +47,17 @@ pub struct EvaluatorConfig {
     pub cache_low_watermark: f64,
 }
 
+pub fn recommended_cache_shards(threads: usize) -> usize {
+    let factor = if threads >= 64 { 32 } else { 8 };
+    threads.saturating_mul(factor).next_power_of_two().max(64)
+}
+
 impl Default for EvaluatorConfig {
     fn default() -> Self {
+        let threads = 6;
         Self {
-            threads: Some(6),
-            cache_shards: 64,
+            threads: Some(threads),
+            cache_shards: recommended_cache_shards(threads),
             max_cache_entries: None,
             cache_low_watermark: 0.95,
         }
@@ -96,6 +102,8 @@ pub struct EvaluatorStats {
     pub active_worker_sum: usize,
     /// Maximum simultaneously active cooperative workers observed.
     pub max_active_workers: usize,
+    /// Time-weighted active worker integral, in microseconds.
+    pub active_worker_micros: usize,
     /// Successor groups entered by any evaluator path.
     pub successor_groups_started: usize,
     /// Canonical successors contained in entered groups.
@@ -119,6 +127,7 @@ pub struct EvaluatorProgress {
     pub evaluations_per_second: f64,
     pub cache_hits_per_second: f64,
     pub unique_positions_per_second: f64,
+    pub time_weighted_active_workers: f64,
 }
 
 #[derive(Default)]
@@ -142,6 +151,7 @@ struct AtomicEvaluatorStats {
     active_worker_samples: AtomicUsize,
     active_worker_sum: AtomicUsize,
     max_active_workers: AtomicUsize,
+    active_worker_clock: Mutex<ActiveWorkerClock>,
     successor_groups_started: AtomicUsize,
     successor_group_successors: AtomicUsize,
     successor_groups_with_new_claim: AtomicUsize,
@@ -170,6 +180,7 @@ impl AtomicEvaluatorStats {
             active_worker_samples: self.active_worker_samples.load(Ordering::Relaxed),
             active_worker_sum: self.active_worker_sum.load(Ordering::Relaxed),
             max_active_workers: self.max_active_workers.load(Ordering::Relaxed),
+            active_worker_micros: self.active_worker_clock.lock().unwrap().active_micros(),
             successor_groups_started: self.successor_groups_started.load(Ordering::Relaxed),
             successor_group_successors: self.successor_group_successors.load(Ordering::Relaxed),
             successor_groups_with_new_claim: self
@@ -199,6 +210,20 @@ impl AtomicEvaluatorStats {
         }
     }
 
+    fn worker_started(&self) {
+        let active = self.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+        self.active_worker_clock.lock().unwrap().set_active(active);
+        self.observe_active_workers(active);
+    }
+
+    fn worker_finished(&self) {
+        let active = self
+            .active_workers
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.active_worker_clock.lock().unwrap().set_active(active);
+    }
+
     fn flush_distribution(&self, distribution: DistributionStats) {
         self.successor_groups_started
             .fetch_add(distribution.successor_groups_started, Ordering::Relaxed);
@@ -214,6 +239,42 @@ impl AtomicEvaluatorStats {
             distribution.successor_revisit_groups_with_busy,
             Ordering::Relaxed,
         );
+    }
+}
+
+#[derive(Debug)]
+struct ActiveWorkerClock {
+    active: usize,
+    last_changed: Instant,
+    active_micros: u128,
+}
+
+impl Default for ActiveWorkerClock {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            last_changed: Instant::now(),
+            active_micros: 0,
+        }
+    }
+}
+
+impl ActiveWorkerClock {
+    fn set_active(&mut self, active: usize) {
+        self.roll_forward();
+        self.active = active;
+    }
+
+    fn active_micros(&mut self) -> usize {
+        self.roll_forward();
+        self.active_micros.min(usize::MAX as u128) as usize
+    }
+
+    fn roll_forward(&mut self) {
+        let now = Instant::now();
+        self.active_micros +=
+            self.active as u128 * now.duration_since(self.last_changed).as_micros();
+        self.last_changed = now;
     }
 }
 
@@ -706,6 +767,8 @@ where
             evaluations_per_second: stats.evaluation_attempts as f64 / seconds,
             cache_hits_per_second: stats.completed_cache_hits as f64 / seconds,
             unique_positions_per_second: stats.unique_positions_claimed as f64 / seconds,
+            time_weighted_active_workers: stats.active_worker_micros as f64
+                / elapsed.as_micros().max(1) as f64,
         }
     }
 
@@ -725,6 +788,8 @@ where
             evaluations_per_second: stats.evaluation_attempts as f64 / seconds,
             cache_hits_per_second: stats.completed_cache_hits as f64 / seconds,
             unique_positions_per_second: stats.unique_positions_claimed as f64 / seconds,
+            time_weighted_active_workers: stats.active_worker_micros as f64
+                / elapsed.as_micros().max(1) as f64,
         }
     }
 
@@ -1008,9 +1073,7 @@ where
                     self.stats
                         .cooperative_worker_entries
                         .fetch_add(1, Ordering::Relaxed);
-                    let active_workers =
-                        self.stats.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
-                    self.stats.observe_active_workers(active_workers);
+                    self.stats.worker_started();
                     self.evaluate_successor_groups_with_seed(
                         self.generator.successor_groups(component),
                         &mut local,
@@ -1018,7 +1081,7 @@ where
                         worker_seed,
                         cancel,
                     );
-                    self.stats.active_workers.fetch_sub(1, Ordering::Relaxed);
+                    self.stats.worker_finished();
 
                     let mut result = result.lock().expect("root result poisoned");
                     result.cancelled |= local.cancelled;
@@ -1565,11 +1628,14 @@ mod tests {
         }
 
         let stats = evaluator.stats();
+        let suite_elapsed = suite_start.elapsed();
         let avg_active_workers = if stats.active_worker_samples == 0 {
             0.0
         } else {
             stats.active_worker_sum as f64 / stats.active_worker_samples as f64
         };
+        let time_weighted_active_workers =
+            stats.active_worker_micros as f64 / suite_elapsed.as_micros().max(1) as f64;
         let groups = stats.successor_groups_started.max(1) as f64;
         let avg_group_size = stats.successor_group_successors as f64 / groups;
         let new_group_rate = stats.successor_groups_with_new_claim as f64 * 100.0 / groups;
@@ -1579,14 +1645,12 @@ mod tests {
         } else {
             stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
         };
-        println!(
-            "\ntotal seconds: {:.3}",
-            suite_start.elapsed().as_secs_f64()
-        );
+        println!("\ntotal seconds: {:.3}", suite_elapsed.as_secs_f64());
         println!("final cache entries: {}", evaluator.cache_len());
         println!(
-            "distribution: avg_active {:.2}  max_active {}  workers {}  descents {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
+            "distribution: sampled_active {:.2}  time_active {:.2}  max_active {}  workers {}  descents {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
             avg_active_workers,
+            time_weighted_active_workers,
             stats.max_active_workers,
             stats.cooperative_worker_entries,
             stats.deferred_descents,

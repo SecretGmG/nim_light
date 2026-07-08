@@ -1,5 +1,6 @@
 use std::{
-    collections::HashSet,
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,8 +10,9 @@ use std::{
 
 use crate::{
     board::{Axis, Cell, Maze, MoveError},
-    evaluator::DfsSolver,
-    solver::compile_maze,
+    evaluator::{DfsSolver, SymmetryFinder},
+    solver::{CanonicalGame, compile_maze},
+    symmetry::InvolutionSymmetryFinder,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,42 +139,104 @@ pub fn solver_move_cancellable(
     solver: &DfsSolver,
     cancel: &Arc<AtomicBool>,
 ) -> SolverMoveResult {
+    let mut candidates = unique_solver_candidates(maze, cancel);
+    if candidates.is_empty() {
+        return if cancel.load(Ordering::Relaxed) {
+            SolverMoveResult::Cancelled
+        } else {
+            SolverMoveResult::NoMove
+        };
+    }
+
+    candidates.sort_by_key(|candidate| Reverse(candidate.removed));
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| immediately_zero(&candidate.game))
+    {
+        return SolverMoveResult::Move(candidate.movement.clone());
+    }
+
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.nodes,
+            candidate.game.components().len(),
+            Reverse(candidate.removed),
+        )
+    });
+
+    for candidate in &candidates {
+        if cancel.load(Ordering::Relaxed) {
+            return SolverMoveResult::Cancelled;
+        }
+        if let Some(nimber) = solver.cached_nimber_of_canonical(&candidate.game) {
+            if nimber == 0 {
+                return SolverMoveResult::Move(candidate.movement.clone());
+            }
+            continue;
+        }
+        match solver.nimber_of_canonical_cancellable(&candidate.game, cancel) {
+            Some(0) => return SolverMoveResult::Move(candidate.movement.clone()),
+            Some(_) => {}
+            None => return SolverMoveResult::Cancelled,
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.removed)
+        .map_or(SolverMoveResult::NoMove, |candidate| {
+            SolverMoveResult::Move(candidate.movement)
+        })
+}
+
+#[derive(Clone)]
+struct SolverCandidate {
+    movement: Move,
+    game: CanonicalGame,
+    removed: usize,
+    nodes: usize,
+}
+
+fn unique_solver_candidates(maze: &Maze, cancel: &Arc<AtomicBool>) -> Vec<SolverCandidate> {
+    let mut candidates: HashMap<CanonicalGame, SolverCandidate> = HashMap::new();
     let corridors = alive_corridors(maze);
     let max_take = corridors
         .iter()
         .map(|corridor| corridor.alive.len())
         .max()
         .unwrap_or(0);
-    let mut fallback = None;
 
     for take in (1..=max_take).rev() {
         if cancel.load(Ordering::Relaxed) {
-            return SolverMoveResult::Cancelled;
+            return Vec::new();
         }
         for corridor in corridors
             .iter()
             .filter(|corridor| corridor.alive.len() >= take)
         {
             if cancel.load(Ordering::Relaxed) {
-                return SolverMoveResult::Cancelled;
+                return Vec::new();
             }
             let mut selected = Vec::with_capacity(take);
-            let mut search = SolverSearch {
+            let mut search = CandidateSearch {
                 maze,
-                solver,
                 corridor,
                 cancel,
-                fallback: &mut fallback,
+                candidates: &mut candidates,
             };
-            match search.winning_combination(take, 0, &mut selected) {
-                SolverMoveResult::Move(movement) => return SolverMoveResult::Move(movement),
-                SolverMoveResult::Cancelled => return SolverMoveResult::Cancelled,
-                SolverMoveResult::NoMove => {}
-            }
+            search.collect(take, 0, &mut selected);
         }
     }
 
-    fallback.map_or(SolverMoveResult::NoMove, SolverMoveResult::Move)
+    candidates.into_values().collect()
+}
+
+fn immediately_zero(game: &CanonicalGame) -> bool {
+    game.is_empty()
+        || game
+            .components()
+            .iter()
+            .all(|component| InvolutionSymmetryFinder.proves_zero(component))
 }
 
 fn alive_corridors(maze: &Maze) -> Vec<Corridor> {
@@ -203,23 +267,17 @@ fn alive_corridors(maze: &Maze) -> Vec<Corridor> {
     result
 }
 
-struct SolverSearch<'a> {
+struct CandidateSearch<'a> {
     maze: &'a Maze,
-    solver: &'a DfsSolver,
     corridor: &'a Corridor,
     cancel: &'a Arc<AtomicBool>,
-    fallback: &'a mut Option<Move>,
+    candidates: &'a mut HashMap<CanonicalGame, SolverCandidate>,
 }
 
-impl SolverSearch<'_> {
-    fn winning_combination(
-        &mut self,
-        take: usize,
-        start: usize,
-        selected: &mut Vec<Cell>,
-    ) -> SolverMoveResult {
+impl CandidateSearch<'_> {
+    fn collect(&mut self, take: usize, start: usize, selected: &mut Vec<Cell>) {
         if self.cancel.load(Ordering::Relaxed) {
-            return SolverMoveResult::Cancelled;
+            return;
         }
 
         if selected.len() == take {
@@ -228,33 +286,42 @@ impl SolverSearch<'_> {
                 anchor: self.corridor.anchor,
                 cells: selected.clone(),
             };
-            self.fallback.get_or_insert_with(|| movement.clone());
 
             let mut next = self.maze.clone();
             next.apply_move(movement.axis, movement.anchor, &movement.cells)
                 .expect("generated solver moves must be legal");
-            return match self
-                .solver
-                .nimber_cancellable(&compile_maze(&next), self.cancel)
-            {
-                Some(0) => SolverMoveResult::Move(movement),
-                Some(_) => SolverMoveResult::NoMove,
-                None => SolverMoveResult::Cancelled,
+            let game = CanonicalGame::from_matrix(&compile_maze(&next));
+            let candidate = SolverCandidate {
+                removed: movement.cells.len(),
+                nodes: game
+                    .components()
+                    .iter()
+                    .map(|component| component.count_ones())
+                    .sum(),
+                movement,
+                game: game.clone(),
             };
+            self.candidates
+                .entry(game)
+                .and_modify(|old| {
+                    if candidate.removed > old.removed {
+                        *old = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+            return;
         }
 
         let remaining = take - selected.len();
         let last_start = self.corridor.alive.len() - remaining;
         for index in start..=last_start {
             selected.push(self.corridor.alive[index]);
-            match self.winning_combination(take, index + 1, selected) {
-                SolverMoveResult::Move(movement) => return SolverMoveResult::Move(movement),
-                SolverMoveResult::Cancelled => return SolverMoveResult::Cancelled,
-                SolverMoveResult::NoMove => {}
-            }
+            self.collect(take, index + 1, selected);
             selected.pop();
+            if self.cancel.load(Ordering::Relaxed) {
+                return;
+            }
         }
-        SolverMoveResult::NoMove
     }
 }
 

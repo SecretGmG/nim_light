@@ -8,7 +8,7 @@ use std::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use nim_light::{
     board::{Axis, BitMatrix, Cell, Maze},
-    evaluator::{DfsSolver, Evaluator, EvaluatorConfig},
+    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, recommended_cache_shards},
     game::{Move, solver_move},
     hybrid_evaluator::HybridEvaluator,
     solver::{CanonicalGame, PseudoCanonicalizer, compile_maze},
@@ -165,7 +165,7 @@ fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
 }
 
 fn cache_shards_for_threads(threads: usize) -> usize {
-    threads.saturating_mul(8).next_power_of_two().max(64)
+    recommended_cache_shards(threads)
 }
 
 fn hybrid_zero_move(

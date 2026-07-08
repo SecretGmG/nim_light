@@ -22,7 +22,9 @@ use crossterm::{
 
 use crate::{
     board::{Axis, Cell, Maze},
-    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress},
+    evaluator::{
+        DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress, recommended_cache_shards,
+    },
     game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
     solver::{PseudoCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
@@ -477,7 +479,7 @@ fn new_evaluator(threads: usize) -> Arc<DfsSolver> {
 }
 
 fn cache_shards_for_threads(threads: usize) -> usize {
-    threads.saturating_mul(8).next_power_of_two().max(64)
+    recommended_cache_shards(threads)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1072,8 +1074,9 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             stats.group_revisits
         )),
         Print(format!(
-            "workers avg {:.1} max {}  groups {} avg {:.1}  new {:.1}% busy {:.1}% revisit-busy {:.1}%\r\n",
+            "workers sampled {:.1} time {:.1} max {}  groups {} avg {:.1}  new {:.1}% busy {:.1}% revisit-busy {:.1}%\r\n",
             avg_active_workers,
+            progress.time_weighted_active_workers,
             stats.max_active_workers,
             stats.successor_groups_started,
             avg_group_size,
@@ -1295,8 +1298,8 @@ mod tests {
         assert_eq!(cache_shards_for_threads(1), 64);
         assert_eq!(cache_shards_for_threads(6), 64);
         assert_eq!(cache_shards_for_threads(16), 128);
-        assert_eq!(cache_shards_for_threads(64), 512);
-        assert_eq!(cache_shards_for_threads(100), 1024);
-        assert_eq!(cache_shards_for_threads(128), 1024);
+        assert_eq!(cache_shards_for_threads(64), 2048);
+        assert_eq!(cache_shards_for_threads(100), 4096);
+        assert_eq!(cache_shards_for_threads(128), 4096);
     }
 }

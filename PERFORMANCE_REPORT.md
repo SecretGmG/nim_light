@@ -381,62 +381,86 @@ Command:
 cargo test --release shared_cache_benchmark_suite -- --ignored --nocapture --test-threads=1
 ```
 
+Implementation notes for this baseline:
+
+- Cache shards use `recommended_cache_shards(threads)`: `threads * 8` rounded
+  up for normal thread counts, and `threads * 32` rounded up from 64 threads
+  onward. This gives 4096 shards at 128 threads.
+- Solver CPU move choice now canonical-deduplicates all legal moves, checks
+  immediate zero candidates first (empty/cancelled components or all remaining
+  components symmetry-certified zero), then computes unique candidates from
+  smallest canonical game to largest.
+- Active worker metrics now include both sampled active workers and a
+  time-weighted active-worker integral.
+
 Current 8-thread release diagnostic baseline:
 
 ```text
 game          matrix     nodes  nimber  seconds  cache  attempts  hits     unique  forced  sym
-dense 5x5       5x5       25       0    1.086   2992      3007   168779    2992      15    15
-dense 3x7       3x7       21       6    0.474   3510      3525   203923    3510      15    18
-spiral 5x5     11x15      25       8    1.576  44050     44617   716163   44050     567    18
-chambers 5x7   13x19      35       5   22.495  93105     93672  2012328   93105     567    24
+dense 5x5       5x5       25       0    0.564   2992      3526   216096    2992     534    15
+dense 3x7       3x7       21       6    0.110   3510      4203   276265    3510     693    18
+spiral 5x5     11x15      25       8    1.591  44050     45314   791669   44050    1264    18
+chambers 5x7   13x19      35       5   22.825  93105     94369  2087834   93105    1264    24
 
-total seconds: 25.631
+total seconds: 25.091
 ```
 
 Final distribution metrics:
 
 ```text
-avg_active_workers:          5.43 / 8  (~67.9% sampled utilization)
+sampled_active_workers:      4.50 / 8  (~56.3% sampled utilization)
+time_active_workers:         0.72 / 8  (~9.0% full-suite time-weighted utilization)
 max_active_workers:          8
-active_worker_samples:       21
+active_worker_samples:       24
+active_worker_micros:        18078405
 cooperative_regions:         3
-cooperative_group_pulls:     21
+cooperative_worker_entries:  24
+deferred_descents:           1264
 
-successor_groups_started:    428275
-successor_group_successors:  1992789
-avg_group_size:              4.65
-groups_with_new_claim:       53374   (12.5%)
-groups_with_busy:            4449    (1.0%)
+successor_groups_started:    435486
+successor_group_successors:  2111003
+avg_group_size:              4.84
+groups_with_new_claim:       53453   (12.3%)
+groups_with_busy:            6003    (1.4%)
 
-processing_hits:             5064    (5.4% of unique positions)
-group_deferrals:             3082
-group_revisits:              3082
-revisit_groups_still_busy:   1367    (44.4% of revisits)
-deferred_resolved:           1415    (45.9% of deferrals)
-forced_duplicate_evals:       567    (0.6% of unique positions)
-duplicate_publish_races:      567
+processing_hits:             6145    (6.6% of unique positions)
+group_deferrals:             4881
+group_revisits:              4881
+revisit_groups_still_busy:   1122    (23.0% of revisits)
+deferred_resolved:              0
+forced_duplicate_evals:      1264    (1.4% of unique positions)
+duplicate_publish_races:     1264
 ```
 
 Interpretation:
 
-- The cooperative root layer does fill all 8 workers at peak, but the sampled
-  average is only about 5.4 active workers. The sample count is low because
-  samples are taken per cooperative group pull, so this is a coarse signal, not
-  a precise utilization integral.
+- The evaluator now uses recursive cooperative workers: every worker enters the
+  same component traversal and, on revisited busy work, descends into that child
+  position with the same policy. This should address dense roots that collapse
+  to only a few top-level groups on large machines.
+- The 8-thread suite is not faster overall because `chambers_5x7` still
+  dominates. Dense positions improved substantially, while the chamber position
+  remains cache-heavy and group-heavy.
+- The sampled average is about 4.5 active workers, but the new time-weighted
+  full-suite metric is only 0.72 workers. This includes phases outside
+  cooperative component evaluation, so it is useful as an end-to-end
+  utilization signal but too pessimistic for only the cooperative regions.
 - Only about 12.5% of successor groups claim new work. Most groups are cache
   probes / already-known nimber propagation.
-- Busy groups are rare overall (1.0%), but when a deferred group is revisited,
-  44.4% are still busy. Deferral often helps, but collision on the same branch
-  remains substantial.
-- Forced duplicate evaluation is low relative to unique positions (0.6%), so
-  the current scheduler is not losing most time by fully recomputing busy
-  states. The larger cost appears to be traversing many cache-heavy successor
-  groups and maintaining enough useful frontier work.
+- Busy groups are still rare overall (1.4%). Revisited groups are less often
+  still busy than in the root-queue model, but the recursive descent policy now
+  turns those cases into duplicate helper descents. Forced duplicates rose to
+  1.3% of unique positions.
+- The large-machine dense `7x7` case should be retested with this model. The
+  expected diagnostic change is `cooperative_worker_entries ~= thread_count`
+  for each cooperative region, rather than root `group pulls` being limited by
+  the number of top-level groups.
 
 Next evaluator/scheduler questions:
 
-1. Replace coarse active-worker sampling with a time-weighted active-worker
-   integral if we need accurate utilization.
+1. Add cooperative-region-local time-weighted utilization. The current
+   full-suite integral is useful, but it mixes cooperative and non-cooperative
+   phases.
 2. Measure group productivity by depth. The current metrics say many groups do
    not claim new work, but not where in the tree this happens.
 3. Try reducing low-productivity group traversal: if a group prefix is mostly
