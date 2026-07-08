@@ -137,6 +137,45 @@ So this is not a local improvement. It is retained for now because the target
 failure mode is large-machine worker correlation, which the local 8-thread
 benchmark does not reproduce well.
 
+### Strided move order inside successor groups
+
+Successor groups now use deterministic strided move order, not linear
+`0, 1, 2, ...` traversal. Deferred group state stores:
+
+```text
+group_index
+group_len
+start
+stride
+visited
+```
+
+This means workers that collide on the same hot group are less likely to test
+the same first successor. Deferral resumes the same move permutation at the
+recorded visited count.
+
+Local 8-thread diagnostic:
+
+```text
+total seconds: 25.236
+distribution: groups 421359  avg_group_size 4.73  deferrals 1171  revisits 1171
+forced duplicates: 323
+processing hits: 1494
+```
+
+Compared with game/depth-mixed group traversal alone:
+
+```text
+total seconds: 25.266
+distribution: groups 424031  avg_group_size 4.80  deferrals 1933  revisits 1933
+forced duplicates: 572
+processing hits: 2505
+```
+
+Wall time is still neutral locally because the 8-thread benchmark is dominated
+by the large `chambers_5x7` case, but the collision metrics improved
+substantially. This is worth testing on the large machine.
+
 ### Adjacent duplicate row skip in move generation
 
 `CanonicalSuccessors` previously used `HashSet<Vec<u64>>` to skip duplicate row

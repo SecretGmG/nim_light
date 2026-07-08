@@ -1164,7 +1164,7 @@ where
         for group_index in StridedIndices::new(groups.len(), seed) {
             self.evaluate_successor_group_with_deferral(
                 &groups,
-                DeferredGroup::new(group_index),
+                DeferredGroup::new(group_index, groups.group_len(group_index), seed),
                 worker,
                 &mut deferred,
                 GroupEvalContext::new(policy, DeferMode::Fresh, depth, cancel),
@@ -1219,12 +1219,12 @@ where
     ) where
         IG: IndexedSuccessorGroups,
     {
-        let start = group.next_move_index;
-        let successor_count = groups.group_len(group.group_index).saturating_sub(start);
+        let group_len = groups.group_len(group.group_index);
+        let successor_count = group_len.saturating_sub(group.visited);
         let mut had_new_claim = false;
         let mut had_busy = false;
         let mut revisit_busy = false;
-        for move_index in start..groups.group_len(group.group_index) {
+        for visited in group.visited..group_len {
             if is_cancelled(context.cancel) {
                 worker.cancelled = true;
                 worker.record_successor_group(
@@ -1235,6 +1235,7 @@ where
                 );
                 return;
             }
+            let move_index = group.move_index(visited);
             let successor = groups.successor(group.group_index, move_index);
             match self.try_nimber(
                 &successor,
@@ -1250,7 +1251,7 @@ where
                     had_busy = true;
                     if context.defer_mode == DeferMode::Fresh {
                         self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
-                        deferred.push(DeferredGroup::starting_at(group.group_index, move_index));
+                        deferred.push(group.resume_at(visited));
                         worker.record_successor_group(
                             successor_count,
                             had_new_claim,
@@ -1393,19 +1394,41 @@ impl<'a> GroupEvalContext<'a> {
 #[derive(Clone, Copy)]
 struct DeferredGroup {
     group_index: usize,
-    next_move_index: usize,
+    len: usize,
+    start: usize,
+    stride: usize,
+    visited: usize,
 }
 
 impl DeferredGroup {
-    fn new(group_index: usize) -> Self {
-        Self::starting_at(group_index, 0)
-    }
-
-    fn starting_at(group_index: usize, next_move_index: usize) -> Self {
+    fn new(group_index: usize, group_len: usize, seed: usize) -> Self {
+        if group_len == 0 {
+            return Self {
+                group_index,
+                len: group_len,
+                start: 0,
+                stride: 1,
+                visited: 0,
+            };
+        }
+        let seed = mix_usize(seed, group_index);
+        let start = seed % group_len;
+        let stride = coprime_stride(seed, group_len);
         Self {
             group_index,
-            next_move_index,
+            len: group_len,
+            start,
+            stride,
+            visited: 0,
         }
+    }
+
+    fn move_index(self, visited: usize) -> usize {
+        (self.start + visited * self.stride) % self.len
+    }
+
+    fn resume_at(self, visited: usize) -> Self {
+        Self { visited, ..self }
     }
 }
 
@@ -1427,10 +1450,7 @@ impl StridedIndices {
             };
         }
         let start = seed % len;
-        let mut stride = mixed_stride(seed, len);
-        while gcd(stride, len) != 1 {
-            stride = stride.saturating_add(1).max(1);
-        }
+        let stride = coprime_stride(seed, len);
         Self {
             len,
             start,
@@ -1460,6 +1480,20 @@ fn mixed_stride(seed: usize, len: usize) -> usize {
         .rotate_left(17)
         | 1;
     1 + mixed % len
+}
+
+fn coprime_stride(seed: usize, len: usize) -> usize {
+    let mut stride = mixed_stride(seed, len);
+    while gcd(stride, len) != 1 {
+        stride = stride.saturating_add(1).max(1);
+    }
+    stride
+}
+
+fn mix_usize(seed: usize, value: usize) -> usize {
+    seed ^ value
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15usize)
+        .rotate_left(23)
 }
 
 fn gcd(mut first: usize, mut second: usize) -> usize {
