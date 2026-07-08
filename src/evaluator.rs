@@ -18,7 +18,7 @@ use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use crate::{
     board::BitMatrix,
     solver::{CanonicalGame, PseudoCanonicalizer},
-    successor::{CanonicalMoveGenerator, SuccessorGenerator},
+    successor::{CanonicalMoveGenerator, IndexedSuccessorGroups, SuccessorGenerator},
     symmetry::InvolutionSymmetryFinder,
 };
 
@@ -1101,15 +1101,14 @@ where
         Some(result.reachable.mex())
     }
 
-    fn evaluate_successor_groups<I, H>(
+    fn evaluate_successor_groups<IG>(
         &self,
-        groups: I,
+        groups: IG,
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
         cancel: Option<&AtomicBool>,
     ) where
-        I: IntoIterator<Item = H>,
-        H: IntoIterator<Item = CanonicalGame>,
+        IG: IndexedSuccessorGroups,
     {
         self.evaluate_successor_groups_with_seed(
             groups,
@@ -1120,53 +1119,53 @@ where
         );
     }
 
-    fn evaluate_successor_groups_with_seed<I, H>(
+    fn evaluate_successor_groups_with_seed<IG>(
         &self,
-        groups: I,
+        groups: IG,
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
         seed: usize,
         cancel: Option<&AtomicBool>,
     ) where
-        I: IntoIterator<Item = H>,
-        H: IntoIterator<Item = CanonicalGame>,
+        IG: IndexedSuccessorGroups,
     {
         let mut deferred = Vec::new();
-        for group in groups {
-            self.evaluate_successor_group_vec_with_deferral(
-                DeferredGroup::new(group.into_iter().collect()),
+        for group_index in StridedIndices::new(groups.len(), seed) {
+            self.evaluate_successor_group_with_deferral(
+                &groups,
+                DeferredGroup::new(group_index),
                 worker,
                 &mut deferred,
-                policy,
-                DeferMode::Fresh,
-                cancel,
+                GroupEvalContext::new(policy, DeferMode::Fresh, cancel),
             );
             if worker.cancelled {
                 return;
             }
         }
-        self.revisit_deferred_groups(deferred, worker, policy, seed, cancel);
+        self.revisit_deferred_groups(deferred, &groups, worker, policy, seed, cancel);
         self.resolve_pending(worker, cancel);
     }
 
-    fn revisit_deferred_groups(
+    fn revisit_deferred_groups<IG>(
         &self,
-        mut deferred: Vec<DeferredGroup>,
+        deferred: Vec<DeferredGroup>,
+        groups: &IG,
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
         seed: usize,
         cancel: Option<&AtomicBool>,
-    ) {
-        rotate_deferred_groups(&mut deferred, seed);
-        for group in deferred {
+    ) where
+        IG: IndexedSuccessorGroups,
+    {
+        for index in StridedIndices::new(deferred.len(), seed) {
+            let group = deferred[index];
             self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
-            self.evaluate_successor_group_vec_with_deferral(
+            self.evaluate_successor_group_with_deferral(
+                groups,
                 group,
                 worker,
                 &mut Vec::new(),
-                policy,
-                DeferMode::Revisit,
-                cancel,
+                GroupEvalContext::new(policy, DeferMode::Revisit, cancel),
             );
             if worker.cancelled {
                 return;
@@ -1174,23 +1173,23 @@ where
         }
     }
 
-    fn evaluate_successor_group_vec_with_deferral(
+    fn evaluate_successor_group_with_deferral<IG>(
         &self,
+        groups: &IG,
         group: DeferredGroup,
         worker: &mut WorkerResult,
         deferred: &mut Vec<DeferredGroup>,
-        policy: EvaluationPolicy,
-        mode: DeferMode,
-        cancel: Option<&AtomicBool>,
-    ) {
-        let successors = group.successors;
-        let start = group.start;
-        let successor_count = successors.len().saturating_sub(start);
+        context: GroupEvalContext<'_>,
+    ) where
+        IG: IndexedSuccessorGroups,
+    {
+        let start = group.next_move_index;
+        let successor_count = groups.group_len(group.group_index).saturating_sub(start);
         let mut had_new_claim = false;
         let mut had_busy = false;
         let mut revisit_busy = false;
-        for (index, successor) in successors.iter().enumerate().skip(start) {
-            if is_cancelled(cancel) {
+        for move_index in start..groups.group_len(group.group_index) {
+            if is_cancelled(context.cancel) {
                 worker.cancelled = true;
                 worker.record_successor_group(
                     successor_count,
@@ -1200,16 +1199,17 @@ where
                 );
                 return;
             }
-            match self.try_nimber(successor, cancel, policy) {
+            let successor = groups.successor(group.group_index, move_index);
+            match self.try_nimber(&successor, context.cancel, context.policy) {
                 Some(Evaluation::Ready { nimber, claimed }) => {
                     had_new_claim |= claimed;
                     worker.reachable.insert(nimber);
                 }
                 Some(Evaluation::Busy) => {
                     had_busy = true;
-                    if mode == DeferMode::Fresh {
+                    if context.defer_mode == DeferMode::Fresh {
                         self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
-                        deferred.push(DeferredGroup::starting_at(successors, index));
+                        deferred.push(DeferredGroup::starting_at(group.group_index, move_index));
                         worker.record_successor_group(
                             successor_count,
                             had_new_claim,
@@ -1219,20 +1219,22 @@ where
                         return;
                     } else {
                         revisit_busy = true;
-                        match policy {
-                            EvaluationPolicy::Serial => worker.pending.push(successor.clone()),
+                        match context.policy {
+                            EvaluationPolicy::Serial => worker.pending.push(successor),
                             EvaluationPolicy::CooperativeAssist => {
                                 self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
-                                if let Some(nimber) = self.cache.get_done(successor) {
+                                if let Some(nimber) = self.cache.get_done(&successor) {
                                     self.stats
                                         .completed_cache_hits
                                         .fetch_add(1, Ordering::Relaxed);
                                     self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
                                     worker.reachable.insert(nimber);
                                 } else {
-                                    let Some(nimber) = self
-                                        .evaluate_duplicate_with_policy(successor, cancel, policy)
-                                    else {
+                                    let Some(nimber) = self.evaluate_duplicate_with_policy(
+                                        &successor,
+                                        context.cancel,
+                                        context.policy,
+                                    ) else {
                                         worker.cancelled = true;
                                         worker.record_successor_group(
                                             successor_count,
@@ -1322,25 +1324,106 @@ enum DeferMode {
     Revisit,
 }
 
+#[derive(Clone, Copy)]
+struct GroupEvalContext<'a> {
+    policy: EvaluationPolicy,
+    defer_mode: DeferMode,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl<'a> GroupEvalContext<'a> {
+    fn new(
+        policy: EvaluationPolicy,
+        defer_mode: DeferMode,
+        cancel: Option<&'a AtomicBool>,
+    ) -> Self {
+        Self {
+            policy,
+            defer_mode,
+            cancel,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct DeferredGroup {
-    successors: Vec<CanonicalGame>,
-    start: usize,
+    group_index: usize,
+    next_move_index: usize,
 }
 
 impl DeferredGroup {
-    fn new(successors: Vec<CanonicalGame>) -> Self {
-        Self::starting_at(successors, 0)
+    fn new(group_index: usize) -> Self {
+        Self::starting_at(group_index, 0)
     }
 
-    fn starting_at(successors: Vec<CanonicalGame>, start: usize) -> Self {
-        Self { successors, start }
+    fn starting_at(group_index: usize, next_move_index: usize) -> Self {
+        Self {
+            group_index,
+            next_move_index,
+        }
     }
 }
 
-fn rotate_deferred_groups(deferred: &mut [DeferredGroup], seed: usize) {
-    if !deferred.is_empty() {
-        deferred.rotate_left(seed % deferred.len());
+struct StridedIndices {
+    len: usize,
+    start: usize,
+    stride: usize,
+    visited: usize,
+}
+
+impl StridedIndices {
+    fn new(len: usize, seed: usize) -> Self {
+        if len == 0 {
+            return Self {
+                len,
+                start: 0,
+                stride: 1,
+                visited: 0,
+            };
+        }
+        let start = seed % len;
+        let mut stride = mixed_stride(seed, len);
+        while gcd(stride, len) != 1 {
+            stride = stride.saturating_add(1).max(1);
+        }
+        Self {
+            len,
+            start,
+            stride,
+            visited: 0,
+        }
     }
+}
+
+impl Iterator for StridedIndices {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.visited == self.len {
+            None
+        } else {
+            let index = (self.start + self.visited * self.stride) % self.len;
+            self.visited += 1;
+            Some(index)
+        }
+    }
+}
+
+fn mixed_stride(seed: usize, len: usize) -> usize {
+    let mixed = seed
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15usize)
+        .rotate_left(17)
+        | 1;
+    1 + mixed % len
+}
+
+fn gcd(mut first: usize, mut second: usize) -> usize {
+    while second != 0 {
+        let remainder = first % second;
+        first = second;
+        second = remainder;
+    }
+    first
 }
 
 struct WorkerResult {

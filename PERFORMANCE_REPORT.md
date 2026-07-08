@@ -74,6 +74,42 @@ This is retained because it simplifies the deferral ownership model and targets
 the high-deferral large-machine workload, even though the small local diagnostic
 does not show a clear speedup.
 
+### Indexed successor groups and strided traversal
+
+The evaluator no longer materializes successor groups as
+`Vec<Vec<CanonicalGame>>`. Move generation now exposes indexed groups:
+
+```text
+groups.len()
+groups.group_len(group)
+groups.successor(group, move)
+```
+
+Each group is represented by a compact row/orientation spec plus masks. Deferred
+work stores only `(group_index, next_move_index)`. Fresh and deferred traversal
+use deterministic strided order, so workers can spread over groups without
+allocating or shuffling full successor lists.
+
+Local 8-thread release diagnostic:
+
+```text
+total seconds: 25.189
+distribution: groups 423912  avg_group_size 4.79  deferrals 1932  revisits 1932
+forced duplicates: 566
+```
+
+Compared with the previous local retained-tail run:
+
+```text
+total seconds: 25.333
+distribution: groups 432879  avg_group_size 4.83  deferrals 4457  revisits 4457
+forced duplicates: 1062
+```
+
+The local wall-time change is small, but the contention/collision metrics moved
+in the intended direction. This should be tested on the 128-core machine, where
+reducing deferred successor materialization and worker correlation matters more.
+
 ### Adjacent duplicate row skip in move generation
 
 `CanonicalSuccessors` previously used `HashSet<Vec<u64>>` to skip duplicate row
