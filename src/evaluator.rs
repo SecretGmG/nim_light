@@ -96,10 +96,6 @@ pub struct EvaluatorStats {
     pub group_deferrals: usize,
     /// Deferred successor groups revisited after fresh groups were exhausted.
     pub group_revisits: usize,
-    /// Samples of active cooperative workers taken when a worker pulls a group.
-    pub active_worker_samples: usize,
-    /// Sum of active cooperative workers over `active_worker_samples`.
-    pub active_worker_sum: usize,
     /// Maximum simultaneously active cooperative workers observed.
     pub max_active_workers: usize,
     /// Time-weighted active worker integral, in microseconds.
@@ -148,8 +144,6 @@ struct AtomicEvaluatorStats {
     group_deferrals: AtomicUsize,
     group_revisits: AtomicUsize,
     active_workers: AtomicUsize,
-    active_worker_samples: AtomicUsize,
-    active_worker_sum: AtomicUsize,
     max_active_workers: AtomicUsize,
     active_worker_clock: Mutex<ActiveWorkerClock>,
     successor_groups_started: AtomicUsize,
@@ -177,8 +171,6 @@ impl AtomicEvaluatorStats {
             deferred_descents: self.deferred_descents.load(Ordering::Relaxed),
             group_deferrals: self.group_deferrals.load(Ordering::Relaxed),
             group_revisits: self.group_revisits.load(Ordering::Relaxed),
-            active_worker_samples: self.active_worker_samples.load(Ordering::Relaxed),
-            active_worker_sum: self.active_worker_sum.load(Ordering::Relaxed),
             max_active_workers: self.max_active_workers.load(Ordering::Relaxed),
             active_worker_micros: self.active_worker_clock.lock().unwrap().active_micros(),
             successor_groups_started: self.successor_groups_started.load(Ordering::Relaxed),
@@ -194,8 +186,6 @@ impl AtomicEvaluatorStats {
     }
 
     fn observe_active_workers(&self, active: usize) {
-        self.active_worker_samples.fetch_add(1, Ordering::Relaxed);
-        self.active_worker_sum.fetch_add(active, Ordering::Relaxed);
         let mut previous = self.max_active_workers.load(Ordering::Relaxed);
         while active > previous {
             match self.max_active_workers.compare_exchange_weak(
@@ -1808,11 +1798,6 @@ mod tests {
 
         let stats = evaluator.stats();
         let suite_elapsed = suite_start.elapsed();
-        let avg_active_workers = if stats.active_worker_samples == 0 {
-            0.0
-        } else {
-            stats.active_worker_sum as f64 / stats.active_worker_samples as f64
-        };
         let time_weighted_active_workers =
             stats.active_worker_micros as f64 / suite_elapsed.as_micros().max(1) as f64;
         let groups = stats.successor_groups_started.max(1) as f64;
@@ -1827,8 +1812,7 @@ mod tests {
         println!("\ntotal seconds: {:.3}", suite_elapsed.as_secs_f64());
         println!("final cache entries: {}", evaluator.cache_len());
         println!(
-            "distribution: sampled_active {:.2}  time_active {:.2}  max_active {}  workers {}  descents {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
-            avg_active_workers,
+            "distribution: active_workers {:.2}/{}  worker_entries {}  descents {}  groups {}  avg_group_size {:.2}  new_groups {:.1}%  busy_groups {:.1}%  revisit_busy {:.1}%",
             time_weighted_active_workers,
             stats.max_active_workers,
             stats.cooperative_worker_entries,

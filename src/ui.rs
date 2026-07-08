@@ -1111,11 +1111,6 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
     let deferral_rate = stats.group_deferrals as f64 * 100.0 / busy;
     let forced_rate = stats.forced_duplicate_evaluations as f64 * 100.0 / busy;
     let resolved_rate = stats.deferred_resolved as f64 * 100.0 / busy;
-    let avg_active_workers = if stats.active_worker_samples == 0 {
-        0.0
-    } else {
-        stats.active_worker_sum as f64 / stats.active_worker_samples as f64
-    };
     let groups = stats.successor_groups_started.max(1) as f64;
     let avg_group_size = stats.successor_group_successors as f64 / groups;
     let new_group_rate = stats.successor_groups_with_new_claim as f64 * 100.0 / groups;
@@ -1167,8 +1162,7 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             stats.group_revisits
         )),
         Print(format!(
-            "workers sampled {:.1} time {:.1} max {}  groups {} avg {:.1}  new {:.1}% busy {:.1}% revisit-busy {:.1}%\r\n",
-            avg_active_workers,
+            "active workers {:.1}/{}  groups {} avg {:.1}  new {:.1}% busy {:.1}% revisit-busy {:.1}%\r\n",
             progress.time_weighted_active_workers,
             stats.max_active_workers,
             stats.successor_groups_started,

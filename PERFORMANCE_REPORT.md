@@ -516,8 +516,9 @@ Implementation notes for this baseline:
   immediate zero candidates first (empty/cancelled components or all remaining
   components symmetry-certified zero), then computes unique candidates from
   smallest canonical game to largest.
-- Active worker metrics now include both sampled active workers and a
-  time-weighted active-worker integral.
+- Active worker metrics now use the time-weighted active-worker integral. The
+  old sampled average was removed because worker startup samples produce a
+  misleading `N / 2` average.
 
 Current 8-thread release diagnostic baseline:
 
@@ -534,10 +535,8 @@ total seconds: 25.091
 Final distribution metrics:
 
 ```text
-sampled_active_workers:      4.50 / 8  (~56.3% sampled utilization)
 time_active_workers:         0.72 / 8  (~9.0% full-suite time-weighted utilization)
 max_active_workers:          8
-active_worker_samples:       24
 active_worker_micros:        18078405
 cooperative_regions:         3
 cooperative_worker_entries:  24
@@ -567,10 +566,9 @@ Interpretation:
 - The 8-thread suite is not faster overall because `chambers_5x7` still
   dominates. Dense positions improved substantially, while the chamber position
   remains cache-heavy and group-heavy.
-- The sampled average is about 4.5 active workers, but the new time-weighted
-  full-suite metric is only 0.72 workers. This includes phases outside
-  cooperative component evaluation, so it is useful as an end-to-end
-  utilization signal but too pessimistic for only the cooperative regions.
+- The time-weighted full-suite metric includes phases outside cooperative
+  component evaluation, so it is useful as an end-to-end utilization signal but
+  too pessimistic for only the cooperative regions.
 - Only about 12.5% of successor groups claim new work. Most groups are cache
   probes / already-known nimber propagation.
 - Busy groups are still rare overall (1.4%). Revisited groups are less often
