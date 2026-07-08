@@ -1134,7 +1134,7 @@ where
         let mut deferred = Vec::new();
         for group in groups {
             self.evaluate_successor_group_vec_with_deferral(
-                group.into_iter().collect(),
+                DeferredGroup::new(group.into_iter().collect()),
                 worker,
                 &mut deferred,
                 policy,
@@ -1151,7 +1151,7 @@ where
 
     fn revisit_deferred_groups(
         &self,
-        mut deferred: Vec<Vec<CanonicalGame>>,
+        mut deferred: Vec<DeferredGroup>,
         worker: &mut WorkerResult,
         policy: EvaluationPolicy,
         seed: usize,
@@ -1176,18 +1176,20 @@ where
 
     fn evaluate_successor_group_vec_with_deferral(
         &self,
-        successors: Vec<CanonicalGame>,
+        group: DeferredGroup,
         worker: &mut WorkerResult,
-        deferred: &mut Vec<Vec<CanonicalGame>>,
+        deferred: &mut Vec<DeferredGroup>,
         policy: EvaluationPolicy,
         mode: DeferMode,
         cancel: Option<&AtomicBool>,
     ) {
-        let successor_count = successors.len();
+        let successors = group.successors;
+        let start = group.start;
+        let successor_count = successors.len().saturating_sub(start);
         let mut had_new_claim = false;
         let mut had_busy = false;
         let mut revisit_busy = false;
-        for (index, successor) in successors.iter().enumerate() {
+        for (index, successor) in successors.iter().enumerate().skip(start) {
             if is_cancelled(cancel) {
                 worker.cancelled = true;
                 worker.record_successor_group(
@@ -1207,7 +1209,7 @@ where
                     had_busy = true;
                     if mode == DeferMode::Fresh {
                         self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
-                        deferred.push(successors[index..].to_vec());
+                        deferred.push(DeferredGroup::starting_at(successors, index));
                         worker.record_successor_group(
                             successor_count,
                             had_new_claim,
@@ -1320,7 +1322,22 @@ enum DeferMode {
     Revisit,
 }
 
-fn rotate_deferred_groups(deferred: &mut [Vec<CanonicalGame>], seed: usize) {
+struct DeferredGroup {
+    successors: Vec<CanonicalGame>,
+    start: usize,
+}
+
+impl DeferredGroup {
+    fn new(successors: Vec<CanonicalGame>) -> Self {
+        Self::starting_at(successors, 0)
+    }
+
+    fn starting_at(successors: Vec<CanonicalGame>, start: usize) -> Self {
+        Self { successors, start }
+    }
+}
+
+fn rotate_deferred_groups(deferred: &mut [DeferredGroup], seed: usize) {
     if !deferred.is_empty() {
         deferred.rotate_left(seed % deferred.len());
     }

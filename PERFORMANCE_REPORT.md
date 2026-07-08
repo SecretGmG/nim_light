@@ -50,6 +50,30 @@ canonicalizer variant relative to its previous baseline.
 
 ## Changes kept
 
+### Deferred successor groups keep a start index
+
+Fresh cooperative evaluation used to defer a busy successor group by cloning the
+remaining tail:
+
+```text
+successors[index..].to_vec()
+```
+
+Deferred groups now keep ownership of the original successor vector plus a
+start index. This removes tail allocation/copy work on every group deferral and
+also makes the recorded average group size count only the still-unvisited tail.
+
+Local 8-thread release diagnostic result was essentially neutral:
+
+```text
+total seconds: 25.333
+distribution: groups 432879  avg_group_size 4.83  deferrals 4457  revisits 4457
+```
+
+This is retained because it simplifies the deferral ownership model and targets
+the high-deferral large-machine workload, even though the small local diagnostic
+does not show a clear speedup.
+
 ### Adjacent duplicate row skip in move generation
 
 `CanonicalSuccessors` previously used `HashSet<Vec<u64>>` to skip duplicate row
