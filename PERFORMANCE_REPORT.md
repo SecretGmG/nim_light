@@ -6,6 +6,28 @@ Fast diagnostic benchmark command:
 cargo test --release shared_cache_benchmark_suite -- --ignored --nocapture --test-threads=1
 ```
 
+## Equivalent-column move classes
+
+The move generator originally treated singleton-column nodes as one
+interchangeable class but enumerated every subset of all other nodes. It now
+groups every set of identical column bit patterns. A class of size `k`
+contributes the `k + 1` choices of removing zero through all of its nodes.
+Singleton columns are therefore handled by the same general mechanism.
+
+Release diagnostic benchmark, before and after:
+
+| metric | leaf-only classes | all identical-column classes | change |
+|---|---:|---:|---:|
+| total time | 25.552 s | 23.726 s | -7.1% |
+| generated successors | 1,981,956 | 1,849,406 | -6.7% |
+| average group size | 4.71 | 4.38 | -7.0% |
+| final cache entries | 93,105 | 93,105 | unchanged |
+
+The dense 5x5 generator now emits 10 representatives before cache
+deduplication instead of 62, while retaining the same five canonical
+successors. Randomized tests compare the optimized generator with exhaustive
+move generation.
+
 Criterion benchmark command:
 
 ```sh

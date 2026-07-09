@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{
     board::BitMatrix,
     solver::{CanonicalGame, Canonicalizer},
@@ -32,12 +34,11 @@ pub trait IndexedSuccessorGroups {
     fn successor(&self, group_index: usize, move_index: usize) -> CanonicalGame;
 }
 
-/// Generates one representative for permutations of leaf nodes on an edge.
+/// Generates one representative for permutations of equivalent nodes on an edge.
 ///
-/// For a row with `s` nodes that also belong to non-singleton columns and `u`
-/// nodes whose columns are singletons, only `2^s * (u + 1) - 1` moves are
-/// required. The singleton-column nodes are interchangeable, so removing the
-/// first `k` represents every choice of `k` such nodes.
+/// Columns with identical bit patterns are interchangeable. A class containing
+/// `k` columns therefore contributes `k + 1` choices: remove zero through all
+/// `k` nodes in that class.
 #[derive(Clone, Debug)]
 pub struct CanonicalMoveGenerator<C> {
     canonicalizer: C,
@@ -172,8 +173,7 @@ enum Orientation {
 struct RowGroupSpec {
     orientation: Orientation,
     row: usize,
-    shared_candidates: Vec<u64>,
-    leaf_columns: Vec<usize>,
+    column_classes: Vec<Vec<usize>>,
     len: usize,
 }
 
@@ -184,8 +184,18 @@ where
     fn new(component: &BitMatrix, canonicalizer: &'a C) -> Self {
         let orientations = [component.clone(), component.transposed()];
         let mut specs = Vec::new();
-        collect_group_specs(&orientations[0], Orientation::Original, &mut specs);
-        collect_group_specs(&orientations[1], Orientation::Transposed, &mut specs);
+        collect_group_specs(
+            &orientations[0],
+            &orientations[1],
+            Orientation::Original,
+            &mut specs,
+        );
+        collect_group_specs(
+            &orientations[1],
+            &orientations[0],
+            Orientation::Transposed,
+            &mut specs,
+        );
         Self {
             canonicalizer,
             orientations,
@@ -200,10 +210,9 @@ where
             Orientation::Original => &self.orientations[0],
             Orientation::Transposed => &self.orientations[1],
         };
-        let (shared_removed, leaf_removed) = removal_masks(spec, move_index);
+        let removed = removal_mask(spec, move_index, matrix.cols());
         let mut result = matrix.clone();
-        result.clear_row_bits(spec.row, &shared_removed);
-        result.clear_row_bits(spec.row, &leaf_removed);
+        result.clear_row_bits(spec.row, &removed);
         result
     }
 }
@@ -228,10 +237,11 @@ where
 
 fn collect_group_specs(
     matrix: &BitMatrix,
+    transposed: &BitMatrix,
     orientation: Orientation,
     specs: &mut Vec<RowGroupSpec>,
 ) {
-    let column_counts = column_counts(matrix);
+    let column_classes = column_classes(transposed);
     let mut previous_row = None;
     for row in 0..matrix.rows() {
         let row_pattern = matrix.row_words(row).to_vec();
@@ -240,76 +250,58 @@ fn collect_group_specs(
         }
         previous_row = Some(row_pattern);
 
-        let word_count = matrix.cols().div_ceil(64);
-        let mut shared_candidates = vec![0; word_count];
-        let mut shared_count = 0;
-        let mut leaf_columns = Vec::new();
-        for col in matrix.row_ones(row) {
-            if column_counts[col] == 1 {
-                leaf_columns.push(col);
-            } else {
-                shared_candidates[col / 64] |= 1 << (col % 64);
-                shared_count += 1;
-            }
-        }
-
-        let len = subset_count_including_empty(shared_count)
-            .saturating_mul(leaf_columns.len() + 1)
+        let row_classes: Vec<_> = column_classes
+            .iter()
+            .filter(|class| matrix.get(row, class[0]))
+            .cloned()
+            .collect();
+        let len = row_classes
+            .iter()
+            .map(|class| class.len() + 1)
+            .fold(1usize, usize::saturating_mul)
             .saturating_sub(1);
         if len != 0 {
             specs.push(RowGroupSpec {
                 orientation,
                 row,
-                shared_candidates,
-                leaf_columns,
+                column_classes: row_classes,
                 len,
             });
         }
     }
 }
 
-fn removal_masks(spec: &RowGroupSpec, move_index: usize) -> (Vec<u64>, Vec<u64>) {
-    let logical_index = move_index.saturating_add(1);
-    let leaf_options = spec.leaf_columns.len() + 1;
-    let shared_subset_index = logical_index / leaf_options;
-    let leaf_count = logical_index % leaf_options;
-
-    let shared_removed = scatter_subset(shared_subset_index, &spec.shared_candidates);
-    let mut leaf_removed = vec![0; spec.shared_candidates.len()];
-    for &col in spec.leaf_columns.iter().take(leaf_count) {
-        leaf_removed[col / 64] |= 1 << (col % 64);
-    }
-    (shared_removed, leaf_removed)
-}
-
-fn scatter_subset(mut subset: usize, allowed: &[u64]) -> Vec<u64> {
-    let mut result = vec![0; allowed.len()];
-    for (result_word, &allowed_word) in result.iter_mut().zip(allowed) {
-        let mut remaining = allowed_word;
-        while remaining != 0 {
-            let bit = remaining & remaining.wrapping_neg();
-            remaining ^= bit;
-            if subset & 1 != 0 {
-                *result_word |= bit;
-            }
-            subset >>= 1;
+fn column_classes(transposed: &BitMatrix) -> Vec<Vec<usize>> {
+    let mut class_by_pattern = HashMap::<Vec<u64>, usize>::new();
+    let mut classes = Vec::<Vec<usize>>::new();
+    for col in 0..transposed.rows() {
+        let pattern = transposed.row_words(col);
+        if let Some(&class) = class_by_pattern.get(pattern) {
+            classes[class].push(col);
+        } else {
+            class_by_pattern.insert(pattern.to_vec(), classes.len());
+            classes.push(vec![col]);
         }
     }
-    result
+    classes
 }
 
-fn column_counts(matrix: &BitMatrix) -> Vec<usize> {
-    let mut counts = vec![0; matrix.cols()];
-    for row in 0..matrix.rows() {
-        for col in matrix.row_ones(row) {
-            counts[col] += 1;
+fn removal_mask(spec: &RowGroupSpec, move_index: usize, columns: usize) -> Vec<u64> {
+    let mut logical_index = move_index.saturating_add(1);
+    let mut removed = vec![0; columns.div_ceil(64)];
+    for class in &spec.column_classes {
+        let remove_count = logical_index % (class.len() + 1);
+        logical_index /= class.len() + 1;
+        for &col in class.iter().take(remove_count) {
+            removed[col / 64] |= 1 << (col % 64);
         }
     }
-    counts
+    removed
 }
 
 fn representative_move_count(matrix: &BitMatrix) -> usize {
-    let counts = column_counts(matrix);
+    let transposed = matrix.transposed();
+    let column_classes = column_classes(&transposed);
     let mut previous_row = None;
     (0..matrix.rows())
         .filter(|&row| {
@@ -322,24 +314,14 @@ fn representative_move_count(matrix: &BitMatrix) -> usize {
             }
         })
         .map(|row| {
-            let mut shared = 0;
-            let mut leaves = 0usize;
-            for col in matrix.row_ones(row) {
-                if counts[col] == 1 {
-                    leaves += 1;
-                } else {
-                    shared += 1;
-                }
-            }
-            subset_count_including_empty(shared)
-                .saturating_mul(leaves + 1)
+            column_classes
+                .iter()
+                .filter(|class| matrix.get(row, class[0]))
+                .map(|class| class.len() + 1)
+                .fold(1usize, usize::saturating_mul)
                 .saturating_sub(1)
         })
         .fold(0, usize::saturating_add)
-}
-
-fn subset_count_including_empty(size: usize) -> usize {
-    1usize.checked_shl(size as u32).unwrap_or(usize::MAX)
 }
 
 /// Increments a bitset while skipping every bit absent from `allowed`.
@@ -431,9 +413,28 @@ mod tests {
 
         assert_eq!(unique.len(), 5);
         assert_eq!(remaining_nodes, vec![20, 21, 22, 23, 24]);
-        assert_eq!(generator.estimated_successors(&grid), 62);
-        assert_eq!(successors.len(), 62);
-        assert_eq!(calls.load(Ordering::Relaxed), 62);
+        assert_eq!(generator.estimated_successors(&grid), 10);
+        assert_eq!(successors.len(), 10);
+        assert_eq!(calls.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn identical_shared_columns_are_enumerated_by_removal_count() {
+        let mut matrix = BitMatrix::new(2, 3);
+        for col in 0..3 {
+            matrix.set(0, col, true);
+        }
+        matrix.set(1, 0, true);
+        matrix.set(1, 1, true);
+
+        let canonicalizer = PseudoCanonicalizer;
+        let generator = CanonicalMoveGenerator::new(canonicalizer);
+        let optimized: Vec<_> = generator.successors(&matrix).collect();
+        let brute = brute_force_successors(&matrix, canonicalizer);
+
+        assert_eq!(generator.estimated_successors(&matrix), 11);
+        assert_eq!(optimized.len(), 11);
+        assert_eq!(optimized.into_iter().collect::<HashSet<_>>(), brute);
     }
 
     #[test]
