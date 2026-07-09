@@ -1,9 +1,8 @@
 //! Parallel depth-first Sprague-Grundy evaluation.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
     fs::File,
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
@@ -13,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hashbrown::{
+    HashMap,
+    hash_map::RawEntryMut::{Occupied, Vacant},
+};
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 
 use crate::{
@@ -269,7 +272,30 @@ impl ActiveWorkerClock {
 }
 
 struct ShardedCache {
-    shards: Vec<Mutex<HashMap<CanonicalGame, CacheEntry>>>,
+    shards: Vec<Mutex<CacheMap>>,
+}
+
+type CacheMap = HashMap<CanonicalGame, CacheEntry, BuildHasherDefault<CacheHasher>>;
+
+struct CacheHasher(u64);
+
+impl Default for CacheHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for CacheHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -303,20 +329,24 @@ impl ShardedCache {
         assert!(shard_count > 0, "the evaluator needs a cache shard");
         Self {
             shards: (0..shard_count)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())))
                 .collect(),
         }
     }
 
     fn probe(&self, game: &CanonicalGame) -> CacheProbe {
-        let shard = self.shard(game);
+        let hash = cache_game_hash(game);
+        let shard = self.shard(hash);
         let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
-        match guard.entry(game.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(CacheEntry::Processing);
+        match guard
+            .raw_entry_mut()
+            .from_hash(hash, |candidate| candidate == game)
+        {
+            Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, game.clone(), CacheEntry::Processing);
                 CacheProbe::Claimed
             }
-            Entry::Occupied(entry) => match entry.get() {
+            Occupied(entry) => match entry.get() {
                 CacheEntry::Processing => CacheProbe::Busy,
                 CacheEntry::Done(nimber) => CacheProbe::Done(*nimber),
             },
@@ -324,10 +354,13 @@ impl ShardedCache {
     }
 
     fn get_done(&self, game: &CanonicalGame) -> Option<usize> {
-        match self.shards[self.shard(game)]
+        let hash = cache_game_hash(game);
+        match self.shards[self.shard(hash)]
             .lock()
             .expect("cache shard poisoned")
-            .get(game)
+            .raw_entry()
+            .from_hash(hash, |candidate| candidate == game)
+            .map(|(_, entry)| entry)
         {
             Some(CacheEntry::Done(nimber)) => Some(*nimber),
             Some(CacheEntry::Processing) | None => None,
@@ -343,7 +376,8 @@ impl ShardedCache {
         max_entries: Option<usize>,
         low_watermark: f64,
     ) -> bool {
-        let shard = self.shard(&game);
+        let hash = cache_game_hash(&game);
+        let shard = self.shard(hash);
         let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
         if let Some(max_entries) = max_entries {
             let shard_max = max_entries.div_ceil(self.shards.len()).max(1);
@@ -351,15 +385,18 @@ impl ShardedCache {
                 let target = ((shard_max as f64) * low_watermark.clamp(0.0, 1.0))
                     .floor()
                     .max(1.0) as usize;
-                evict_done_entries(&mut guard, target, stable_game_hash(&game));
+                evict_done_entries(&mut guard, target, hash);
             }
         }
-        match guard.entry(game) {
-            Entry::Vacant(entry) => {
-                entry.insert(CacheEntry::Done(nimber));
+        match guard
+            .raw_entry_mut()
+            .from_hash(hash, |candidate| candidate == &game)
+        {
+            Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, game, CacheEntry::Done(nimber));
                 true
             }
-            Entry::Occupied(mut entry) => match entry.get() {
+            Occupied(mut entry) => match entry.get() {
                 CacheEntry::Processing => {
                     entry.insert(CacheEntry::Done(nimber));
                     true
@@ -384,7 +421,7 @@ impl ShardedCache {
         for shard in &self.shards {
             let guard = shard.lock().expect("cache shard poisoned");
             profile.entries += guard.len();
-            profile.estimated_bytes += std::mem::size_of::<HashMap<CanonicalGame, CacheEntry>>();
+            profile.estimated_bytes += std::mem::size_of::<CacheMap>();
             for (game, entry) in guard.iter() {
                 match entry {
                     CacheEntry::Processing => profile.processing += 1,
@@ -410,10 +447,21 @@ impl ShardedCache {
     }
 
     fn insert_done(&self, game: CanonicalGame, nimber: usize) {
-        self.shards[self.shard(&game)]
+        let hash = cache_game_hash(&game);
+        let mut shard = self.shards[self.shard(hash)]
             .lock()
-            .expect("cache shard poisoned")
-            .insert(game, CacheEntry::Done(nimber));
+            .expect("cache shard poisoned");
+        match shard
+            .raw_entry_mut()
+            .from_hash(hash, |candidate| candidate == &game)
+        {
+            Occupied(mut entry) => {
+                entry.insert(CacheEntry::Done(nimber));
+            }
+            Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, game, CacheEntry::Done(nimber));
+            }
+        }
     }
 
     fn save_to(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
@@ -480,10 +528,8 @@ impl ShardedCache {
         }
     }
 
-    fn shard(&self, game: &CanonicalGame) -> usize {
-        let mut hasher = DefaultHasher::new();
-        game.hash(&mut hasher);
-        hasher.finish() as usize % self.shards.len()
+    fn shard(&self, hash: u64) -> usize {
+        hash as usize % self.shards.len()
     }
 }
 
@@ -561,11 +607,7 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn evict_done_entries(
-    guard: &mut HashMap<CanonicalGame, CacheEntry>,
-    target: usize,
-    new_game_hash: u64,
-) {
+fn evict_done_entries(guard: &mut CacheMap, target: usize, new_game_hash: u64) {
     while guard.len() > target {
         let Some(victim) = guard
             .iter()
@@ -587,6 +629,12 @@ fn estimate_cache_entry_bytes(game: &CanonicalGame) -> usize {
             .iter()
             .map(BitMatrix::estimated_bytes)
             .sum::<usize>()
+}
+
+fn cache_game_hash(game: &CanonicalGame) -> u64 {
+    let mut hasher = CacheHasher::default();
+    game.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn stable_game_hash(game: &CanonicalGame) -> u64 {

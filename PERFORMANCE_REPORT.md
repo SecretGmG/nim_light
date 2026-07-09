@@ -23,10 +23,48 @@ Release diagnostic benchmark, before and after:
 | average group size | 4.71 | 4.38 | -7.0% |
 | final cache entries | 93,105 | 93,105 | unchanged |
 
-The dense 5x5 generator now emits 10 representatives before cache
-deduplication instead of 62, while retaining the same five canonical
-successors. Randomized tests compare the optimized generator with exhaustive
-move generation.
+Before transpose-symmetry elimination, the dense 5x5 generator emitted 10
+representatives before cache deduplication instead of 62, while retaining the
+same five canonical successors. Randomized tests compare the optimized
+generator with exhaustive move generation.
+
+## Transpose-symmetric move generation
+
+When a component is literally equal to its transpose, column moves are
+isomorphic to row moves. The generator now omits the transposed orientation in
+that case. Dense 5x5 therefore emits five representatives rather than ten.
+
+The release diagnostic benchmark was effectively neutral:
+
+| metric | before | transpose elimination |
+|---|---:|---:|
+| total time | 23.401 s | 23.577 s |
+| generated successors | 1,848,181 | 1,833,517 |
+| final cache entries | 93,105 | 93,105 |
+
+The optimization is retained because it is exact, simple, and reduces cache
+traffic; the timing difference is within normal run-to-run noise.
+
+## Single-hash cache lookup
+
+Cache access previously hashed the complete canonical game once to select a
+shard and again inside that shard's standard `HashMap`. The second hash was
+performed while holding the shard mutex. Cache shards now use hashbrown raw
+entries with one deterministic precomputed hash for shard selection, lookup,
+and insertion.
+
+The 8-thread release diagnostic benchmark was neutral:
+
+| metric | standard HashMap | single-hash hashbrown |
+|---|---:|---:|
+| total time | 23.550 s | 23.817 s |
+| final cache entries | 93,105 | 93,105 |
+| completed cache hits | 1,865,631 | 1,865,617 |
+
+The small timing difference is within normal scheduler noise. This is retained
+for high-core validation because it removes a complete key scan from inside
+the shard lock without increasing cache-entry size. That contention benefit is
+not represented well by the local 8-thread benchmark.
 
 Criterion benchmark command:
 
@@ -343,22 +381,29 @@ interactive editor workload turns out to be dominated by tiny sparse mazes.
 
 ## Rejected / not retained variants
 
-### Full column-bit-pattern grouping in move generation
+### Pair-intersection refinement
 
-I tried generalizing leaf compression: for each row, group columns by identical
-full column bit-pattern and enumerate only "remove first k from this group".
-This is mathematically reasonable and greatly reduces generated moves on dense
-symmetric rows.
+I seeded WL colors with the sorted multiset of pairwise row intersections and
+the corresponding column intersections. This improved canonicalization quality
+only slightly: the evaluator cache fell from 93,105 to 93,083 entries.
 
-It was substantially slower on the benchmark:
+The full diagnostic run changed from 23.401 s to 23.035 s, which is too small
+to distinguish from noise. More importantly, the canonicalization-only
+benchmark exposed large regressions on the bigger maze-shaped inputs:
 
-```text
-total seconds: 9.955-10.179 in the older fast baseline shape
-```
+| game | change |
+|---|---:|
+| dense 5x5 | -11% |
+| dense 7x7 | -8% |
+| dense 10x10 | about -13% |
+| dense 3x7 | neutral |
+| spiral 5x5 | neutral |
+| spiral 9x9 | +50% |
+| chambers 5x7 | neutral |
+| chambers 9x11 | about +37% |
 
-The likely reason is that full column-pattern grouping adds expensive per-row
-setup and changes the parallel/cache dynamics. Even with precomputed column
-patterns per orientation, it remained much slower. Rejected.
+The 0.024% cache reduction does not justify the cost on positions relevant to
+the 9x9 target, so this refinement was reverted.
 
 ### Cheap move-count estimate
 

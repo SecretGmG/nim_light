@@ -111,7 +111,12 @@ where
 
     fn estimated_successors(&self, component: &BitMatrix) -> usize {
         let transposed = component.transposed();
-        representative_move_count(component).saturating_add(representative_move_count(&transposed))
+        let horizontal = representative_move_count(component);
+        if component == &transposed {
+            horizontal
+        } else {
+            horizontal.saturating_add(representative_move_count(&transposed))
+        }
     }
 }
 
@@ -190,12 +195,14 @@ where
             Orientation::Original,
             &mut specs,
         );
-        collect_group_specs(
-            &orientations[1],
-            &orientations[0],
-            Orientation::Transposed,
-            &mut specs,
-        );
+        if orientations[0] != orientations[1] {
+            collect_group_specs(
+                &orientations[1],
+                &orientations[0],
+                Orientation::Transposed,
+                &mut specs,
+            );
+        }
         Self {
             canonicalizer,
             orientations,
@@ -413,9 +420,9 @@ mod tests {
 
         assert_eq!(unique.len(), 5);
         assert_eq!(remaining_nodes, vec![20, 21, 22, 23, 24]);
-        assert_eq!(generator.estimated_successors(&grid), 10);
-        assert_eq!(successors.len(), 10);
-        assert_eq!(calls.load(Ordering::Relaxed), 10);
+        assert_eq!(generator.estimated_successors(&grid), 5);
+        assert_eq!(successors.len(), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
     }
 
     #[test]
