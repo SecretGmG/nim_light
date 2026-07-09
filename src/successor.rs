@@ -217,9 +217,8 @@ where
             Orientation::Original => &self.orientations[0],
             Orientation::Transposed => &self.orientations[1],
         };
-        let removed = removal_mask(spec, move_index, matrix.cols());
         let mut result = matrix.clone();
-        result.clear_row_bits(spec.row, &removed);
+        clear_row_columns(&mut result, spec, move_index);
         result
     }
 }
@@ -293,17 +292,13 @@ fn column_classes(transposed: &BitMatrix) -> Vec<Vec<usize>> {
     classes
 }
 
-fn removal_mask(spec: &RowGroupSpec, move_index: usize, columns: usize) -> Vec<u64> {
+fn clear_row_columns(result: &mut BitMatrix, spec: &RowGroupSpec, move_index: usize) {
     let mut logical_index = move_index.saturating_add(1);
-    let mut removed = vec![0; columns.div_ceil(64)];
     for class in &spec.column_classes {
         let remove_count = logical_index % (class.len() + 1);
         logical_index /= class.len() + 1;
-        for &col in class.iter().take(remove_count) {
-            removed[col / 64] |= 1 << (col % 64);
-        }
+        result.clear_row_columns(spec.row, class.iter().take(remove_count).copied());
     }
-    removed
 }
 
 fn representative_move_count(matrix: &BitMatrix) -> usize {

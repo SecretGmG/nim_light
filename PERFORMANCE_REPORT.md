@@ -45,7 +45,7 @@ The release diagnostic benchmark was effectively neutral:
 The optimization is retained because it is exact, simple, and reduces cache
 traffic; the timing difference is within normal run-to-run noise.
 
-## Single-hash cache lookup
+## Single-hash cache lookup (reverted)
 
 Cache access previously hashed the complete canonical game once to select a
 shard and again inside that shard's standard `HashMap`. The second hash was
@@ -61,10 +61,10 @@ The 8-thread release diagnostic benchmark was neutral:
 | final cache entries | 93,105 | 93,105 |
 | completed cache hits | 1,865,631 | 1,865,617 |
 
-The small timing difference is within normal scheduler noise. This is retained
-for high-core validation because it removes a complete key scan from inside
-the shard lock without increasing cache-entry size. That contention benefit is
-not represented well by the local 8-thread benchmark.
+The small local timing difference was within normal scheduler noise, but the
+target 128-core machine was approximately 10% slower. The expected reduction
+in lock-held hashing did not compensate for the changed hash-table access
+path. The hashbrown dependency and raw-entry implementation were reverted.
 
 Criterion benchmark command:
 

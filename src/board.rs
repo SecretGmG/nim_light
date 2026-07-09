@@ -144,6 +144,19 @@ impl BitMatrix {
         }
     }
 
+    pub(crate) fn clear_row_columns(
+        &mut self,
+        row: usize,
+        columns: impl IntoIterator<Item = usize>,
+    ) {
+        assert!(row < self.rows);
+        let start = row * self.words_per_row;
+        for col in columns {
+            assert!(col < self.cols);
+            self.data[start + col / 64] &= !(1 << (col % 64));
+        }
+    }
+
     pub fn swap_rows(&mut self, first: usize, second: usize) {
         assert!(first < self.rows && second < self.rows);
         if first == second {
