@@ -1038,6 +1038,11 @@ fn render_editor(
     editor: &Editor,
     computing: Option<(ProgressView, Duration)>,
 ) -> io::Result<()> {
+    let cache_label = if stats_collection_enabled() {
+        editor.evaluator.cache_len().to_string()
+    } else {
+        "hidden".to_owned()
+    };
     queue!(
         stdout,
         MoveTo(0, 0),
@@ -1054,7 +1059,7 @@ fn render_editor(
             editor.solver_threads,
             editor.cache_shards,
             if editor.symmetry_enabled { "on" } else { "off" },
-            editor.evaluator.cache_len()
+            cache_label
         )),
         Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
         Print(
