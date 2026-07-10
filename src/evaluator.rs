@@ -7,7 +7,7 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -23,7 +23,6 @@ use crate::{
 };
 
 const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH02";
-const DEPTH_BUCKETS: usize = 8;
 
 /// A conservative zero certificate evaluated after a cache miss.
 pub trait SymmetryFinder: Send + Sync {
@@ -144,14 +143,6 @@ pub struct EvaluatorStats {
     pub cache_get_ops: usize,
     /// Cache publish/insert attempts.
     pub cache_insert_ops: usize,
-    /// Cache lock acquisitions.
-    pub cache_lock_ops: usize,
-    /// Wall time spent waiting for cache shard locks, in microseconds.
-    pub cache_lock_wait_micros: usize,
-    /// Component depths where fresh work was claimed. Final bucket is overflow.
-    pub fresh_claim_depths: [usize; DEPTH_BUCKETS],
-    /// Component depths where uncached component evaluation started. Final bucket is overflow.
-    pub component_eval_depths: [usize; DEPTH_BUCKETS],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -193,8 +184,6 @@ struct AtomicEvaluatorStats {
     successor_groups_with_new_claim: AtomicUsize,
     successor_groups_with_busy: AtomicUsize,
     successor_revisit_groups_with_busy: AtomicUsize,
-    fresh_claim_depths: [AtomicUsize; DEPTH_BUCKETS],
-    component_eval_depths: [AtomicUsize; DEPTH_BUCKETS],
 }
 
 impl AtomicEvaluatorStats {
@@ -229,16 +218,6 @@ impl AtomicEvaluatorStats {
             cache_probe_ops: 0,
             cache_get_ops: 0,
             cache_insert_ops: 0,
-            cache_lock_ops: 0,
-            cache_lock_wait_micros: 0,
-            fresh_claim_depths: self
-                .fresh_claim_depths
-                .each_ref()
-                .map(|counter| counter.load(Ordering::Relaxed)),
-            component_eval_depths: self
-                .component_eval_depths
-                .each_ref()
-                .map(|counter| counter.load(Ordering::Relaxed)),
         }
     }
 
@@ -287,18 +266,6 @@ impl AtomicEvaluatorStats {
             Ordering::Relaxed,
         );
     }
-
-    fn record_fresh_claim_depth(&self, depth: usize) {
-        self.fresh_claim_depths[depth_bucket(depth)].fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_component_eval_depth(&self, depth: usize) {
-        self.component_eval_depths[depth_bucket(depth)].fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn depth_bucket(depth: usize) -> usize {
-    depth.min(DEPTH_BUCKETS - 1)
 }
 
 #[derive(Debug)]
@@ -347,8 +314,6 @@ struct CacheDiagnostics {
     probe_ops: AtomicUsize,
     get_ops: AtomicUsize,
     insert_ops: AtomicUsize,
-    lock_ops: AtomicUsize,
-    lock_wait_micros: AtomicUsize,
 }
 
 impl CacheDiagnostics {
@@ -356,8 +321,6 @@ impl CacheDiagnostics {
         stats.cache_probe_ops = self.probe_ops.load(Ordering::Relaxed);
         stats.cache_get_ops = self.get_ops.load(Ordering::Relaxed);
         stats.cache_insert_ops = self.insert_ops.load(Ordering::Relaxed);
-        stats.cache_lock_ops = self.lock_ops.load(Ordering::Relaxed);
-        stats.cache_lock_wait_micros = self.lock_wait_micros.load(Ordering::Relaxed);
     }
 }
 
@@ -401,7 +364,7 @@ impl ShardedCache {
     fn probe(&self, component: &BitMatrix) -> CacheProbe {
         self.diagnostics.probe_ops.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(component);
-        let mut guard = self.lock_shard(shard);
+        let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
         match guard.entry(component.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(CacheEntry::Processing);
@@ -416,7 +379,11 @@ impl ShardedCache {
 
     fn get_done(&self, component: &BitMatrix) -> Option<usize> {
         self.diagnostics.get_ops.fetch_add(1, Ordering::Relaxed);
-        match self.lock_shard(self.shard(component)).get(component) {
+        match self.shards[self.shard(component)]
+            .lock()
+            .expect("cache shard poisoned")
+            .get(component)
+        {
             Some(CacheEntry::Done(nimber)) => Some(*nimber),
             Some(CacheEntry::Processing) | None => None,
         }
@@ -433,7 +400,7 @@ impl ShardedCache {
     ) -> bool {
         self.diagnostics.insert_ops.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(&component);
-        let mut guard = self.lock_shard(shard);
+        let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
         if let Some(max_entries) = max_entries {
             let shard_max = max_entries.div_ceil(self.shards.len()).max(1);
             if guard.len() >= shard_max {
@@ -464,15 +431,14 @@ impl ShardedCache {
     fn len(&self) -> usize {
         self.shards
             .iter()
-            .enumerate()
-            .map(|(index, _)| self.lock_shard(index).len())
+            .map(|shard| shard.lock().expect("cache shard poisoned").len())
             .sum()
     }
 
     fn profile(&self) -> CacheProfile {
         let mut profile = CacheProfile::default();
-        for index in 0..self.shards.len() {
-            let guard = self.lock_shard(index);
+        for shard in &self.shards {
+            let guard = shard.lock().expect("cache shard poisoned");
             profile.entries += guard.len();
             profile.estimated_bytes += std::mem::size_of::<HashMap<BitMatrix, CacheEntry>>();
             for (component, entry) in guard.iter() {
@@ -488,8 +454,8 @@ impl ShardedCache {
 
     fn clone_done_into_shards(&self, shard_count: usize) -> Self {
         let copied = Self::new(shard_count);
-        for index in 0..self.shards.len() {
-            let guard = self.lock_shard(index);
+        for shard in &self.shards {
+            let guard = shard.lock().expect("cache shard poisoned");
             for (component, entry) in guard.iter() {
                 if let CacheEntry::Done(nimber) = entry {
                     copied.insert_done(component.clone(), *nimber);
@@ -501,7 +467,9 @@ impl ShardedCache {
 
     fn insert_done(&self, component: BitMatrix, nimber: usize) {
         let shard = self.shard(&component);
-        self.lock_shard(shard)
+        self.shards[shard]
+            .lock()
+            .expect("cache shard poisoned")
             .insert(component, CacheEntry::Done(nimber));
     }
 
@@ -510,9 +478,9 @@ impl ShardedCache {
         file.write_all(CACHE_FILE_MAGIC)?;
         write_u64(&mut file, 0)?;
         let mut entries = 0;
-        for index in 0..self.shards.len() {
+        for shard in &self.shards {
             let shard_entries: Vec<_> = {
-                let guard = self.lock_shard(index);
+                let guard = shard.lock().expect("cache shard poisoned");
                 guard
                     .iter()
                     .filter_map(|(component, entry)| match entry {
@@ -555,31 +523,22 @@ impl ShardedCache {
     }
 
     fn clear(&self) {
-        for index in 0..self.shards.len() {
-            self.lock_shard(index).clear();
+        for shard in &self.shards {
+            shard.lock().expect("cache shard poisoned").clear();
         }
     }
 
     fn clear_processing(&self) {
-        for index in 0..self.shards.len() {
-            self.lock_shard(index)
+        for shard in &self.shards {
+            shard
+                .lock()
+                .expect("cache shard poisoned")
                 .retain(|_, entry| matches!(entry, CacheEntry::Done(_)));
         }
     }
 
     fn add_diagnostics_to(&self, stats: &mut EvaluatorStats) {
         self.diagnostics.add_to(stats);
-    }
-
-    fn lock_shard(&self, shard: usize) -> MutexGuard<'_, HashMap<BitMatrix, CacheEntry>> {
-        let start = Instant::now();
-        let guard = self.shards[shard].lock().expect("cache shard poisoned");
-        let waited = start.elapsed().as_micros().min(usize::MAX as u128) as usize;
-        self.diagnostics.lock_ops.fetch_add(1, Ordering::Relaxed);
-        self.diagnostics
-            .lock_wait_micros
-            .fetch_add(waited, Ordering::Relaxed);
-        guard
     }
 
     fn shard(&self, component: &BitMatrix) -> usize {
@@ -971,7 +930,6 @@ where
                 self.stats
                     .unique_positions_claimed
                     .fetch_add(1, Ordering::Relaxed);
-                self.stats.record_fresh_claim_depth(0);
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
@@ -1037,7 +995,6 @@ where
                 self.stats
                     .unique_positions_claimed
                     .fetch_add(1, Ordering::Relaxed);
-                self.stats.record_fresh_claim_depth(depth);
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
@@ -1061,7 +1018,6 @@ where
         if is_cancelled(cancel) {
             return None;
         }
-        self.stats.record_component_eval_depth(depth);
         self.evaluate_component_uncached(component, cancel, policy, depth)
     }
 
@@ -1782,20 +1738,6 @@ mod tests {
         result
     }
 
-    fn format_depth_buckets(buckets: [usize; DEPTH_BUCKETS]) -> String {
-        format!(
-            "0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7+:{}",
-            buckets[0],
-            buckets[1],
-            buckets[2],
-            buckets[3],
-            buckets[4],
-            buckets[5],
-            buckets[6],
-            buckets[7]
-        )
-    }
-
     #[test]
     fn single_row_positions_have_heap_nimbers() {
         let solver = DfsSolver::default();
@@ -1990,12 +1932,6 @@ mod tests {
         } else {
             stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
         };
-        let cache_wait_ms = stats.cache_lock_wait_micros as f64 / 1000.0;
-        let cache_wait_ns_per_lock = if stats.cache_lock_ops == 0 {
-            0.0
-        } else {
-            stats.cache_lock_wait_micros as f64 * 1000.0 / stats.cache_lock_ops as f64
-        };
         println!("\ntotal seconds: {:.3}", suite_elapsed.as_secs_f64());
         println!("final cache entries: {}", evaluator.cache_len());
         println!(
@@ -2011,18 +1947,8 @@ mod tests {
             revisit_busy_rate,
         );
         println!(
-            "cache: probe/get/insert {}/{}/{}  locks {}  wait {:.1}ms {:.0}ns/lock",
-            stats.cache_probe_ops,
-            stats.cache_get_ops,
-            stats.cache_insert_ops,
-            stats.cache_lock_ops,
-            cache_wait_ms,
-            cache_wait_ns_per_lock,
-        );
-        println!(
-            "depth: fresh [{}]  eval [{}]",
-            format_depth_buckets(stats.fresh_claim_depths),
-            format_depth_buckets(stats.component_eval_depths)
+            "cache: probe/get/insert {}/{}/{}",
+            stats.cache_probe_ops, stats.cache_get_ops, stats.cache_insert_ops,
         );
         println!("final stats: {stats:#?}");
         assert_eq!(
