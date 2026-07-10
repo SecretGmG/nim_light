@@ -40,6 +40,33 @@ impl SymmetryFinder for NoSymmetryFinder {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct ToggleableSymmetryFinder {
+    enabled: bool,
+}
+
+impl ToggleableSymmetryFinder {
+    pub const fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+}
+
+impl Default for ToggleableSymmetryFinder {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl SymmetryFinder for ToggleableSymmetryFinder {
+    fn proves_zero(&self, component: &BitMatrix) -> bool {
+        self.enabled && InvolutionSymmetryFinder.proves_zero(component)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct EvaluatorConfig {
     pub threads: Option<usize>,
     pub cache_shards: usize,
@@ -1589,13 +1616,28 @@ impl NimberSet {
     }
 }
 
-pub type DfsSolver = Evaluator<CanonicalMoveGenerator<RankCanonicalizer>, InvolutionSymmetryFinder>;
+pub type DfsSolver = Evaluator<CanonicalMoveGenerator<RankCanonicalizer>, ToggleableSymmetryFinder>;
 
 impl Default for DfsSolver {
     fn default() -> Self {
         Self::new(
             CanonicalMoveGenerator::new(RankCanonicalizer::default()),
-            InvolutionSymmetryFinder,
+            ToggleableSymmetryFinder::default(),
+        )
+    }
+}
+
+impl DfsSolver {
+    pub fn with_symmetry_preserving_cache(
+        &self,
+        enabled: bool,
+    ) -> Result<Self, ThreadPoolBuildError> {
+        let cache = self.cache.clone_done_into_shards(self.config.cache_shards);
+        Self::with_config_and_cache(
+            self.generator.clone(),
+            ToggleableSymmetryFinder::new(enabled),
+            self.config,
+            cache,
         )
     }
 }
@@ -1614,7 +1656,7 @@ mod tests {
     use super::*;
     use crate::{
         board::Maze,
-        solver::{Canonicalizer, PseudoCanonicalizer},
+        solver::{Canonicalizer, RankCanonicalizer},
         successor::CanonicalMoveGenerator,
     };
 
@@ -1682,7 +1724,7 @@ mod tests {
         println!("threads  seconds  speedup  attempts  proc_hits  deferred  forced  unique_states");
         for threads in thread_counts {
             let evaluator = Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 NoSymmetryFinder,
                 EvaluatorConfig {
                     threads: Some(threads),
@@ -1725,7 +1767,7 @@ mod tests {
         );
         for (label, grid) in [("5x5", dense_grid(5)), ("4x6", dense_rectangle(4, 6))] {
             let without = Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 NoSymmetryFinder,
                 EvaluatorConfig::default(),
             )
@@ -1736,7 +1778,7 @@ mod tests {
             print_ab_result(label, "off", without_elapsed, &without);
 
             let with = Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 InvolutionSymmetryFinder,
                 EvaluatorConfig::default(),
             )
@@ -1757,24 +1799,7 @@ mod tests {
         run_shared_cache_benchmark_suite(
             "current",
             Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
-                InvolutionSymmetryFinder,
-                EvaluatorConfig {
-                    threads: Some(8),
-                    ..EvaluatorConfig::default()
-                },
-            )
-            .unwrap(),
-        );
-    }
-
-    #[test]
-    #[ignore = "manual shared-cache rank-canonicalizer performance benchmark"]
-    fn shared_cache_rank_canonicalizer_benchmark_suite() {
-        run_shared_cache_benchmark_suite(
-            "rank",
-            Evaluator::with_config(
-                CanonicalMoveGenerator::new(crate::solver::RankCanonicalizer::default()),
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 InvolutionSymmetryFinder,
                 EvaluatorConfig {
                     threads: Some(8),
@@ -1942,7 +1967,7 @@ mod tests {
     #[test]
     fn cache_claims_processing_positions_before_publishing() {
         let cache = ShardedCache::new(4);
-        let game = PseudoCanonicalizer.canonicalize(heap(2));
+        let game = CanonicalGame::from_matrix(&heap(2));
 
         assert_eq!(cache.probe(&game), CacheProbe::Claimed);
         assert_eq!(cache.probe(&game), CacheProbe::Busy);
@@ -1963,7 +1988,7 @@ mod tests {
         }
 
         let evaluator = Evaluator::new(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            CanonicalMoveGenerator::new(RankCanonicalizer::default()),
             Certificate,
         );
         assert_eq!(evaluator.nimber(&heap(3)), 0);
@@ -1979,7 +2004,7 @@ mod tests {
         impl Canonicalizer for CountingCanonicalizer {
             fn canonicalize(&self, matrix: BitMatrix) -> CanonicalGame {
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                PseudoCanonicalizer.canonicalize(matrix)
+                RankCanonicalizer::default().canonicalize(matrix)
             }
         }
 
@@ -1998,7 +2023,7 @@ mod tests {
     fn parallel_and_sequential_evaluators_agree() {
         let matrix = heap(6);
         let single_threaded = Evaluator::with_config(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            CanonicalMoveGenerator::new(RankCanonicalizer::default()),
             NoSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(1),
@@ -2007,7 +2032,7 @@ mod tests {
         )
         .unwrap();
         let parallel = Evaluator::with_config(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            CanonicalMoveGenerator::new(RankCanonicalizer::default()),
             NoSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(4),
@@ -2029,7 +2054,7 @@ mod tests {
             spiral_maze_game(3, 3),
         ] {
             let single_threaded = Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 InvolutionSymmetryFinder,
                 EvaluatorConfig {
                     threads: Some(1),

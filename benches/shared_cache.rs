@@ -1,53 +1,20 @@
-use std::{
-    collections::HashSet,
-    hint::black_box,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{hint::black_box, time::Duration};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nim_light::{
-    board::{Axis, BitMatrix, Cell, Maze},
-    evaluator::{DfsSolver, Evaluator, EvaluatorConfig, recommended_cache_shards},
-    game::{Move, solver_move},
-    hybrid_evaluator::HybridEvaluator,
-    solver::{CanonicalGame, Canonicalizer, PseudoCanonicalizer, RankCanonicalizer, compile_maze},
+    board::{BitMatrix, Maze},
+    evaluator::{
+        DfsSolver, Evaluator, EvaluatorConfig, ToggleableSymmetryFinder, recommended_cache_shards,
+    },
+    game::solver_move,
+    solver::{CanonicalGame, compile_maze},
     successor::CanonicalMoveGenerator,
-    symmetry::InvolutionSymmetryFinder,
 };
 
 fn shared_cache_suite(c: &mut Criterion) {
-    c.bench_function("shared_cache_suite_8_threads/current", |bencher| {
+    c.bench_function("shared_cache_suite_8_threads", |bencher| {
         bencher.iter(|| {
-            let evaluator = Evaluator::with_config(
-                CanonicalMoveGenerator::new(PseudoCanonicalizer),
-                InvolutionSymmetryFinder,
-                EvaluatorConfig {
-                    threads: Some(8),
-                    ..EvaluatorConfig::default()
-                },
-            )
-            .unwrap();
-
-            for game in benchmark_games() {
-                black_box(evaluator.nimber(&game));
-            }
-            black_box(evaluator.stats());
-        });
-    });
-
-    c.bench_function("shared_cache_suite_8_threads/rank", |bencher| {
-        bencher.iter(|| {
-            let evaluator = Evaluator::with_config(
-                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
-                InvolutionSymmetryFinder,
-                EvaluatorConfig {
-                    threads: Some(8),
-                    ..EvaluatorConfig::default()
-                },
-            )
-            .unwrap();
-
+            let evaluator = new_evaluator();
             for game in benchmark_games() {
                 black_box(evaluator.nimber(&game));
             }
@@ -64,70 +31,6 @@ fn exact_nimber_ab(c: &mut Criterion) {
                 black_box(evaluator.nimber(&game));
             });
         });
-
-        c.bench_function(&format!("exact_nimber/hybrid_depth_2/{label}"), |bencher| {
-            bencher.iter(|| {
-                let evaluator = new_evaluator();
-                let hybrid = HybridEvaluator::new(2);
-                let cancel = Arc::new(AtomicBool::new(false));
-                black_box(hybrid.exact_nimber(&game, &evaluator, &cancel));
-            });
-        });
-    }
-}
-
-fn zero_ruling_ab(c: &mut Criterion) {
-    for (label, game) in labelled_benchmark_games() {
-        c.bench_function(&format!("zero_ruling/current_exact/{label}"), |bencher| {
-            bencher.iter(|| {
-                let evaluator = new_evaluator();
-                black_box(evaluator.nimber(&game) == 0);
-            });
-        });
-
-        c.bench_function(&format!("zero_ruling/hybrid_depth_2/{label}"), |bencher| {
-            bencher.iter(|| {
-                let evaluator = new_evaluator();
-                let hybrid = HybridEvaluator::new(2);
-                let cancel = Arc::new(AtomicBool::new(false));
-                let canonical = CanonicalGame::from_matrix(&game);
-                black_box(hybrid.prove_zero_of_canonical(&canonical, &evaluator, &cancel));
-            });
-        });
-    }
-}
-
-fn dense_five_by_five_hybrid_depths(c: &mut Criterion) {
-    let game = dense_rectangle(5, 5);
-    for depth in 0..=3 {
-        c.bench_function(
-            &format!("dense_5x5_exact/hybrid_depth_{depth}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator();
-                    let hybrid = HybridEvaluator::new(depth);
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    black_box(hybrid.exact_nimber(&game, &evaluator, &cancel));
-                });
-            },
-        );
-    }
-}
-
-fn dense_three_by_seven_nonzero_proof_depths(c: &mut Criterion) {
-    let game = CanonicalGame::from_matrix(&dense_rectangle(3, 7));
-    for depth in 0..=3 {
-        c.bench_function(
-            &format!("dense_3x7_nonzero_proof/hybrid_depth_{depth}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator();
-                    let hybrid = HybridEvaluator::new(depth);
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    black_box(hybrid.prove_zero_of_canonical(&game, &evaluator, &cancel));
-                });
-            },
-        );
     }
 }
 
@@ -140,33 +43,13 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
             black_box(solver_move(&maze, &evaluator));
         });
     });
-
-    for depth in 0..=3 {
-        c.bench_function(
-            &format!("cpu_find_zero_move/open_3x7/hybrid_depth_{depth}"),
-            |bencher| {
-                bencher.iter(|| {
-                    let evaluator = new_evaluator();
-                    let hybrid = HybridEvaluator::new(depth);
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    black_box(hybrid_zero_move(&maze, &evaluator, &hybrid, &cancel));
-                });
-            },
-        );
-    }
 }
 
 fn canonicalization_suite(c: &mut Criterion) {
     for (label, game) in canonicalization_benchmark_games() {
-        c.bench_function(&format!("canonicalize/current/{label}"), |bencher| {
+        c.bench_function(&format!("canonicalize/{label}"), |bencher| {
             bencher.iter(|| {
                 black_box(CanonicalGame::from_matrix(black_box(&game)));
-            });
-        });
-
-        c.bench_function(&format!("canonicalize/rank/{label}"), |bencher| {
-            bencher.iter(|| {
-                black_box(RankCanonicalizer::default().canonicalize(black_box(game.clone())));
             });
         });
     }
@@ -178,8 +61,8 @@ fn new_evaluator() -> DfsSolver {
 
 fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
     Evaluator::with_config(
-        CanonicalMoveGenerator::new(RankCanonicalizer::default()),
-        InvolutionSymmetryFinder,
+        CanonicalMoveGenerator::default(),
+        ToggleableSymmetryFinder::default(),
         EvaluatorConfig {
             threads: Some(threads),
             cache_shards: cache_shards_for_threads(threads),
@@ -191,107 +74,6 @@ fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
 
 fn cache_shards_for_threads(threads: usize) -> usize {
     recommended_cache_shards(threads)
-}
-
-fn hybrid_zero_move(
-    maze: &Maze,
-    evaluator: &DfsSolver,
-    hybrid: &HybridEvaluator,
-    cancel: &Arc<AtomicBool>,
-) -> Option<Move> {
-    for movement in ordered_maze_moves(maze) {
-        let mut next = maze.clone();
-        next.apply_move(movement.axis, movement.anchor, &movement.cells)
-            .expect("generated benchmark moves must be legal");
-        let game = CanonicalGame::from_matrix(&compile_maze(&next));
-        if matches!(
-            hybrid.prove_zero_of_canonical(&game, evaluator, cancel),
-            nim_light::hybrid_evaluator::ZeroProof::Zero
-        ) {
-            return Some(movement);
-        }
-    }
-    None
-}
-
-fn ordered_maze_moves(maze: &Maze) -> Vec<Move> {
-    let corridors = alive_corridors(maze);
-    let max_take = corridors
-        .iter()
-        .map(|corridor| corridor.alive.len())
-        .max()
-        .unwrap_or(0);
-    let mut moves = Vec::new();
-    for take in (1..=max_take).rev() {
-        for corridor in corridors
-            .iter()
-            .filter(|corridor| corridor.alive.len() >= take)
-        {
-            let mut selected = Vec::with_capacity(take);
-            collect_combinations(corridor, take, 0, &mut selected, &mut moves);
-        }
-    }
-    moves
-}
-
-#[derive(Clone)]
-struct BenchCorridor {
-    axis: Axis,
-    anchor: Cell,
-    alive: Vec<Cell>,
-}
-
-fn alive_corridors(maze: &Maze) -> Vec<BenchCorridor> {
-    let mut result = Vec::new();
-    for axis in [Axis::Horizontal, Axis::Vertical] {
-        let mut seen = HashSet::new();
-        for row in 0..maze.rows() {
-            for col in 0..maze.cols() {
-                let corridor = maze.corridor(Cell::new(row, col), axis);
-                if !seen.insert(corridor.clone()) {
-                    continue;
-                }
-                let alive: Vec<_> = corridor
-                    .iter()
-                    .copied()
-                    .filter(|&cell| maze.is_alive(cell))
-                    .collect();
-                if !alive.is_empty() {
-                    result.push(BenchCorridor {
-                        axis,
-                        anchor: corridor[0],
-                        alive,
-                    });
-                }
-            }
-        }
-    }
-    result
-}
-
-fn collect_combinations(
-    corridor: &BenchCorridor,
-    take: usize,
-    start: usize,
-    selected: &mut Vec<Cell>,
-    moves: &mut Vec<Move>,
-) {
-    if selected.len() == take {
-        moves.push(Move {
-            axis: corridor.axis,
-            anchor: corridor.anchor,
-            cells: selected.clone(),
-        });
-        return;
-    }
-
-    let remaining = take - selected.len();
-    let last_start = corridor.alive.len() - remaining;
-    for index in start..=last_start {
-        selected.push(corridor.alive[index]);
-        collect_combinations(corridor, take, index + 1, selected, moves);
-        selected.pop();
-    }
 }
 
 fn labelled_benchmark_games() -> [(&'static str, BitMatrix); 4] {
@@ -436,7 +218,7 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(30));
-    targets = shared_cache_suite, exact_nimber_ab, zero_ruling_ab, dense_five_by_five_hybrid_depths, dense_three_by_seven_nonzero_proof_depths, cpu_style_find_zero_move
+    targets = shared_cache_suite, exact_nimber_ab, cpu_style_find_zero_move
 }
 criterion_group! {
     name = canonicalization_benches;

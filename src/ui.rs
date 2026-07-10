@@ -23,12 +23,12 @@ use crossterm::{
 use crate::{
     board::{Axis, Cell, Maze},
     evaluator::{
-        DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress, recommended_cache_shards,
+        DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress, ToggleableSymmetryFinder,
+        recommended_cache_shards,
     },
     game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
     solver::{RankCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
-    symmetry::InvolutionSymmetryFinder,
 };
 
 struct TerminalGuard;
@@ -300,6 +300,7 @@ struct Editor {
     evaluator: Arc<DfsSolver>,
     solver_threads: usize,
     cache_shards: usize,
+    symmetry_enabled: bool,
     last_evaluation: Option<EvaluationReport>,
     nimber_is_current: bool,
     last_cancelled: bool,
@@ -315,9 +316,10 @@ impl Editor {
             row: 0,
             col: 0,
             target: EditTarget::Node,
-            evaluator: new_evaluator(solver_threads, cache_shards),
+            evaluator: new_evaluator(solver_threads, cache_shards, true),
             solver_threads,
             cache_shards,
+            symmetry_enabled: true,
             last_evaluation: None,
             nimber_is_current: false,
             last_cancelled: false,
@@ -354,7 +356,11 @@ impl Editor {
     }
 
     fn clear_cache(&mut self) {
-        self.evaluator = new_evaluator(self.solver_threads, self.cache_shards);
+        self.evaluator = new_evaluator(
+            self.solver_threads,
+            self.cache_shards,
+            self.symmetry_enabled,
+        );
         self.last_evaluation = None;
         self.nimber_is_current = false;
         self.last_cancelled = false;
@@ -404,6 +410,27 @@ impl Editor {
             }
             Err(error) => {
                 self.cache_status = Some(format!("failed to change cache shards: {error}"));
+            }
+        }
+    }
+
+    fn toggle_symmetry(&mut self) {
+        self.symmetry_enabled = !self.symmetry_enabled;
+        match self
+            .evaluator
+            .with_symmetry_preserving_cache(self.symmetry_enabled)
+        {
+            Ok(evaluator) => {
+                self.evaluator = Arc::new(evaluator);
+                self.last_cancelled = false;
+                self.cache_status = Some(format!(
+                    "symmetry finder {}; completed cache entries preserved",
+                    if self.symmetry_enabled { "on" } else { "off" }
+                ));
+            }
+            Err(error) => {
+                self.symmetry_enabled = !self.symmetry_enabled;
+                self.cache_status = Some(format!("failed to toggle symmetry finder: {error}"));
             }
         }
     }
@@ -487,11 +514,11 @@ const MAX_SOLVER_THREADS: usize = 1024;
 const MAX_CACHE_SHARDS: usize = 65_536;
 const CACHE_FILE: &str = "nim_light.cache";
 
-fn new_evaluator(threads: usize, cache_shards: usize) -> Arc<DfsSolver> {
+fn new_evaluator(threads: usize, cache_shards: usize, symmetry_enabled: bool) -> Arc<DfsSolver> {
     Arc::new(
         Evaluator::with_config(
             CanonicalMoveGenerator::new(RankCanonicalizer::default()),
-            InvolutionSymmetryFinder,
+            ToggleableSymmetryFinder::new(symmetry_enabled),
             EvaluatorConfig {
                 threads: Some(threads),
                 cache_shards,
@@ -557,6 +584,7 @@ fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGa
                         editor.set_cache_shards(shards);
                     }
                 }
+                KeyCode::Char('y') => editor.toggle_symmetry(),
                 KeyCode::Char('r') => editor.reset_demo(),
                 KeyCode::Char('o') => editor.reset_open(),
                 KeyCode::Char('+') | KeyCode::Char('=') => editor.resize(1, 0),
@@ -1018,17 +1046,20 @@ fn render_editor(
         Print("NIM LIGHT — editor\r\n"),
         ResetColor,
         Print(format!(
-            "{}×{}  target: {}  nodes: {}  threads: {}  shards: {}  cache: {}\r\n",
+            "{}×{}  target: {}  nodes: {}  threads: {}  shards: {}  symmetry: {}  cache: {}\r\n",
             editor.maze.rows(),
             editor.maze.cols(),
             editor.target.name(),
             editor.maze.alive_count(),
             editor.solver_threads,
             editor.cache_shards,
+            if editor.symmetry_enabled { "on" } else { "off" },
             editor.evaluator.cache_len()
         )),
         Print("Move arrows/hjkl · Tab target · Space toggle · n nimber · c clear cache\r\n"),
-        Print("S save cache · L load cache · t threads · s shards · +/- rows · </> cols\r\n"),
+        Print(
+            "S save cache · L load cache · t threads · s shards · y symmetry · +/- rows · </> cols\r\n"
+        ),
         Print("r demo · o open · m/Esc menu · q quit\r\n\r\n")
     )?;
 

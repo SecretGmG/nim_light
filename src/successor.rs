@@ -60,6 +60,15 @@ impl<C> CanonicalMoveGenerator<C> {
     }
 }
 
+impl<C> Default for CanonicalMoveGenerator<C>
+where
+    C: Default,
+{
+    fn default() -> Self {
+        Self::new(C::default())
+    }
+}
+
 impl<C> CanonicalMoveGenerator<C>
 where
     C: Canonicalizer,
@@ -350,7 +359,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::solver::PseudoCanonicalizer;
+    use crate::solver::RankCanonicalizer;
 
     fn heap(size: usize) -> BitMatrix {
         let mut result = BitMatrix::new(1, size);
@@ -363,7 +372,7 @@ mod tests {
     #[test]
     fn leaf_nodes_reduce_the_number_of_generated_representatives() {
         let component = heap(3);
-        let generator = CanonicalMoveGenerator::new(PseudoCanonicalizer);
+        let generator = CanonicalMoveGenerator::new(RankCanonicalizer::default());
 
         // Three row representatives plus one representative for the three
         // identical singleton-column rows. Brute force would generate ten.
@@ -384,7 +393,7 @@ mod tests {
         impl Canonicalizer for CountingCanonicalizer {
             fn canonicalize(&self, matrix: BitMatrix) -> CanonicalGame {
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                PseudoCanonicalizer.canonicalize(matrix)
+                RankCanonicalizer::default().canonicalize(matrix)
             }
         }
 
@@ -429,7 +438,7 @@ mod tests {
         matrix.set(1, 0, true);
         matrix.set(1, 1, true);
 
-        let canonicalizer = PseudoCanonicalizer;
+        let canonicalizer = RankCanonicalizer::default();
         let generator = CanonicalMoveGenerator::new(canonicalizer);
         let optimized: Vec<_> = generator.successors(&matrix).collect();
         let brute = brute_force_successors(&matrix, canonicalizer);
@@ -458,7 +467,7 @@ mod tests {
 
     #[test]
     fn optimized_generator_matches_brute_force_on_random_components() {
-        let canonicalizer = PseudoCanonicalizer;
+        let canonicalizer = RankCanonicalizer::default();
         let generator = CanonicalMoveGenerator::new(canonicalizer);
         let mut random = TestRandom(0x51cc_3550);
 
@@ -485,7 +494,7 @@ mod tests {
 
     fn brute_force_successors(
         component: &BitMatrix,
-        canonicalizer: PseudoCanonicalizer,
+        canonicalizer: RankCanonicalizer,
     ) -> HashSet<CanonicalGame> {
         let mut successors = HashSet::new();
         for matrix in [component.clone(), component.transposed()] {
