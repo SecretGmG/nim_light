@@ -137,12 +137,6 @@ pub struct EvaluatorStats {
     pub successor_groups_with_busy: usize,
     /// Revisited deferred groups that were still busy.
     pub successor_revisit_groups_with_busy: usize,
-    /// Cache probes that may claim, observe busy, or observe done entries.
-    pub cache_probe_ops: usize,
-    /// Read-only completed-cache lookups.
-    pub cache_get_ops: usize,
-    /// Cache publish/insert attempts.
-    pub cache_insert_ops: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -215,9 +209,6 @@ impl AtomicEvaluatorStats {
             successor_revisit_groups_with_busy: self
                 .successor_revisit_groups_with_busy
                 .load(Ordering::Relaxed),
-            cache_probe_ops: 0,
-            cache_get_ops: 0,
-            cache_insert_ops: 0,
         }
     }
 
@@ -306,22 +297,6 @@ impl ActiveWorkerClock {
 
 struct ShardedCache {
     shards: Vec<Mutex<HashMap<BitMatrix, CacheEntry>>>,
-    diagnostics: CacheDiagnostics,
-}
-
-#[derive(Default)]
-struct CacheDiagnostics {
-    probe_ops: AtomicUsize,
-    get_ops: AtomicUsize,
-    insert_ops: AtomicUsize,
-}
-
-impl CacheDiagnostics {
-    fn add_to(&self, stats: &mut EvaluatorStats) {
-        stats.cache_probe_ops = self.probe_ops.load(Ordering::Relaxed);
-        stats.cache_get_ops = self.get_ops.load(Ordering::Relaxed);
-        stats.cache_insert_ops = self.insert_ops.load(Ordering::Relaxed);
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -357,12 +332,10 @@ impl ShardedCache {
             shards: (0..shard_count)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
-            diagnostics: CacheDiagnostics::default(),
         }
     }
 
     fn probe(&self, component: &BitMatrix) -> CacheProbe {
-        self.diagnostics.probe_ops.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(component);
         let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
         match guard.entry(component.clone()) {
@@ -378,7 +351,6 @@ impl ShardedCache {
     }
 
     fn get_done(&self, component: &BitMatrix) -> Option<usize> {
-        self.diagnostics.get_ops.fetch_add(1, Ordering::Relaxed);
         match self.shards[self.shard(component)]
             .lock()
             .expect("cache shard poisoned")
@@ -398,7 +370,6 @@ impl ShardedCache {
         max_entries: Option<usize>,
         low_watermark: f64,
     ) -> bool {
-        self.diagnostics.insert_ops.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(&component);
         let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
         if let Some(max_entries) = max_entries {
@@ -535,10 +506,6 @@ impl ShardedCache {
                 .expect("cache shard poisoned")
                 .retain(|_, entry| matches!(entry, CacheEntry::Done(_)));
         }
-    }
-
-    fn add_diagnostics_to(&self, stats: &mut EvaluatorStats) {
-        self.diagnostics.add_to(stats);
     }
 
     fn shard(&self, component: &BitMatrix) -> usize {
@@ -801,9 +768,7 @@ where
     }
 
     pub fn stats(&self) -> EvaluatorStats {
-        let mut stats = self.stats.snapshot();
-        self.cache.add_diagnostics_to(&mut stats);
-        stats
+        self.stats.snapshot()
     }
 
     pub fn progress(&self) -> EvaluatorProgress {
@@ -1945,10 +1910,6 @@ mod tests {
             new_group_rate,
             busy_group_rate,
             revisit_busy_rate,
-        );
-        println!(
-            "cache: probe/get/insert {}/{}/{}",
-            stats.cache_probe_ops, stats.cache_get_ops, stats.cache_insert_ops,
         );
         println!("final stats: {stats:#?}");
         assert_eq!(

@@ -1203,10 +1203,6 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             revisit_busy_rate
         )),
         Print(format!(
-            "cache ops probe/get/insert {}/{}/{}\r\n",
-            stats.cache_probe_ops, stats.cache_get_ops, stats.cache_insert_ops
-        )),
-        Print(format!(
             "{:.0} eval/s  {:.0} unique/s  {:.0} hit/s  uptime {:.2?}\r\n",
             progress.evaluations_per_second,
             progress.unique_positions_per_second,
