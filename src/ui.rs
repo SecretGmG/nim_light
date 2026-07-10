@@ -1151,6 +1151,12 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
     } else {
         stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
     };
+    let cache_wait_ms = stats.cache_lock_wait_micros as f64 / 1000.0;
+    let cache_wait_ns_per_lock = if stats.cache_lock_ops == 0 {
+        0.0
+    } else {
+        stats.cache_lock_wait_micros as f64 * 1000.0 / stats.cache_lock_ops as f64
+    };
     let estimated_bytes = if progress.estimated_cache_bytes == 0 && view.profile_age.is_none() {
         "~n/a".to_owned()
     } else if let Some(age) = view.profile_age {
@@ -1203,12 +1209,39 @@ fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()
             revisit_busy_rate
         )),
         Print(format!(
+            "cache ops probe/get/insert {}/{}/{}  lock-wait {:.1}ms {:.0}ns/lock\r\n",
+            stats.cache_probe_ops,
+            stats.cache_get_ops,
+            stats.cache_insert_ops,
+            cache_wait_ms,
+            cache_wait_ns_per_lock
+        )),
+        Print(format!(
+            "depth fresh [{}]  eval [{}]\r\n",
+            format_depth_buckets(stats.fresh_claim_depths),
+            format_depth_buckets(stats.component_eval_depths)
+        )),
+        Print(format!(
             "{:.0} eval/s  {:.0} unique/s  {:.0} hit/s  uptime {:.2?}\r\n",
             progress.evaluations_per_second,
             progress.unique_positions_per_second,
             progress.cache_hits_per_second,
             progress.elapsed
         ))
+    )
+}
+
+fn format_depth_buckets(buckets: [usize; 8]) -> String {
+    format!(
+        "0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7+:{}",
+        buckets[0],
+        buckets[1],
+        buckets[2],
+        buckets[3],
+        buckets[4],
+        buckets[5],
+        buckets[6],
+        buckets[7]
     )
 }
 

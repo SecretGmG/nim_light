@@ -117,16 +117,6 @@ impl CanonicalGame {
         self.components.is_empty()
     }
 
-    pub(crate) fn component(&self, index: usize) -> Self {
-        Self {
-            components: vec![self.components[index].clone()],
-        }
-    }
-
-    pub(crate) fn from_canonical_components(components: Vec<BitMatrix>) -> Self {
-        Self { components }
-    }
-
     fn from_components(mut components: Vec<BitMatrix>) -> Self {
         components.sort();
 

@@ -7,7 +7,7 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -22,7 +22,8 @@ use crate::{
     symmetry::InvolutionSymmetryFinder,
 };
 
-const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH01";
+const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH02";
+const DEPTH_BUCKETS: usize = 8;
 
 /// A conservative zero certificate evaluated after a cache miss.
 pub trait SymmetryFinder: Send + Sync {
@@ -137,6 +138,20 @@ pub struct EvaluatorStats {
     pub successor_groups_with_busy: usize,
     /// Revisited deferred groups that were still busy.
     pub successor_revisit_groups_with_busy: usize,
+    /// Cache probes that may claim, observe busy, or observe done entries.
+    pub cache_probe_ops: usize,
+    /// Read-only completed-cache lookups.
+    pub cache_get_ops: usize,
+    /// Cache publish/insert attempts.
+    pub cache_insert_ops: usize,
+    /// Cache lock acquisitions.
+    pub cache_lock_ops: usize,
+    /// Wall time spent waiting for cache shard locks, in microseconds.
+    pub cache_lock_wait_micros: usize,
+    /// Component depths where fresh work was claimed. Final bucket is overflow.
+    pub fresh_claim_depths: [usize; DEPTH_BUCKETS],
+    /// Component depths where uncached component evaluation started. Final bucket is overflow.
+    pub component_eval_depths: [usize; DEPTH_BUCKETS],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -178,6 +193,8 @@ struct AtomicEvaluatorStats {
     successor_groups_with_new_claim: AtomicUsize,
     successor_groups_with_busy: AtomicUsize,
     successor_revisit_groups_with_busy: AtomicUsize,
+    fresh_claim_depths: [AtomicUsize; DEPTH_BUCKETS],
+    component_eval_depths: [AtomicUsize; DEPTH_BUCKETS],
 }
 
 impl AtomicEvaluatorStats {
@@ -209,6 +226,19 @@ impl AtomicEvaluatorStats {
             successor_revisit_groups_with_busy: self
                 .successor_revisit_groups_with_busy
                 .load(Ordering::Relaxed),
+            cache_probe_ops: 0,
+            cache_get_ops: 0,
+            cache_insert_ops: 0,
+            cache_lock_ops: 0,
+            cache_lock_wait_micros: 0,
+            fresh_claim_depths: self
+                .fresh_claim_depths
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
+            component_eval_depths: self
+                .component_eval_depths
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
         }
     }
 
@@ -257,6 +287,18 @@ impl AtomicEvaluatorStats {
             Ordering::Relaxed,
         );
     }
+
+    fn record_fresh_claim_depth(&self, depth: usize) {
+        self.fresh_claim_depths[depth_bucket(depth)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_component_eval_depth(&self, depth: usize) {
+        self.component_eval_depths[depth_bucket(depth)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn depth_bucket(depth: usize) -> usize {
+    depth.min(DEPTH_BUCKETS - 1)
 }
 
 #[derive(Debug)]
@@ -296,7 +338,27 @@ impl ActiveWorkerClock {
 }
 
 struct ShardedCache {
-    shards: Vec<Mutex<HashMap<CanonicalGame, CacheEntry>>>,
+    shards: Vec<Mutex<HashMap<BitMatrix, CacheEntry>>>,
+    diagnostics: CacheDiagnostics,
+}
+
+#[derive(Default)]
+struct CacheDiagnostics {
+    probe_ops: AtomicUsize,
+    get_ops: AtomicUsize,
+    insert_ops: AtomicUsize,
+    lock_ops: AtomicUsize,
+    lock_wait_micros: AtomicUsize,
+}
+
+impl CacheDiagnostics {
+    fn add_to(&self, stats: &mut EvaluatorStats) {
+        stats.cache_probe_ops = self.probe_ops.load(Ordering::Relaxed);
+        stats.cache_get_ops = self.get_ops.load(Ordering::Relaxed);
+        stats.cache_insert_ops = self.insert_ops.load(Ordering::Relaxed);
+        stats.cache_lock_ops = self.lock_ops.load(Ordering::Relaxed);
+        stats.cache_lock_wait_micros = self.lock_wait_micros.load(Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -332,13 +394,15 @@ impl ShardedCache {
             shards: (0..shard_count)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
+            diagnostics: CacheDiagnostics::default(),
         }
     }
 
-    fn probe(&self, game: &CanonicalGame) -> CacheProbe {
-        let shard = self.shard(game);
-        let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
-        match guard.entry(game.clone()) {
+    fn probe(&self, component: &BitMatrix) -> CacheProbe {
+        self.diagnostics.probe_ops.fetch_add(1, Ordering::Relaxed);
+        let shard = self.shard(component);
+        let mut guard = self.lock_shard(shard);
+        match guard.entry(component.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(CacheEntry::Processing);
                 CacheProbe::Claimed
@@ -350,12 +414,9 @@ impl ShardedCache {
         }
     }
 
-    fn get_done(&self, game: &CanonicalGame) -> Option<usize> {
-        match self.shards[self.shard(game)]
-            .lock()
-            .expect("cache shard poisoned")
-            .get(game)
-        {
+    fn get_done(&self, component: &BitMatrix) -> Option<usize> {
+        self.diagnostics.get_ops.fetch_add(1, Ordering::Relaxed);
+        match self.lock_shard(self.shard(component)).get(component) {
             Some(CacheEntry::Done(nimber)) => Some(*nimber),
             Some(CacheEntry::Processing) | None => None,
         }
@@ -365,23 +426,24 @@ impl ShardedCache {
     /// harmless completed-result race.
     fn insert_if_absent(
         &self,
-        game: CanonicalGame,
+        component: BitMatrix,
         nimber: usize,
         max_entries: Option<usize>,
         low_watermark: f64,
     ) -> bool {
-        let shard = self.shard(&game);
-        let mut guard = self.shards[shard].lock().expect("cache shard poisoned");
+        self.diagnostics.insert_ops.fetch_add(1, Ordering::Relaxed);
+        let shard = self.shard(&component);
+        let mut guard = self.lock_shard(shard);
         if let Some(max_entries) = max_entries {
             let shard_max = max_entries.div_ceil(self.shards.len()).max(1);
             if guard.len() >= shard_max {
                 let target = ((shard_max as f64) * low_watermark.clamp(0.0, 1.0))
                     .floor()
                     .max(1.0) as usize;
-                evict_done_entries(&mut guard, target, stable_game_hash(&game));
+                evict_done_entries(&mut guard, target, stable_matrix_hash(&component));
             }
         }
-        match guard.entry(game) {
+        match guard.entry(component) {
             Entry::Vacant(entry) => {
                 entry.insert(CacheEntry::Done(nimber));
                 true
@@ -402,22 +464,23 @@ impl ShardedCache {
     fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().expect("cache shard poisoned").len())
+            .enumerate()
+            .map(|(index, _)| self.lock_shard(index).len())
             .sum()
     }
 
     fn profile(&self) -> CacheProfile {
         let mut profile = CacheProfile::default();
-        for shard in &self.shards {
-            let guard = shard.lock().expect("cache shard poisoned");
+        for index in 0..self.shards.len() {
+            let guard = self.lock_shard(index);
             profile.entries += guard.len();
-            profile.estimated_bytes += std::mem::size_of::<HashMap<CanonicalGame, CacheEntry>>();
-            for (game, entry) in guard.iter() {
+            profile.estimated_bytes += std::mem::size_of::<HashMap<BitMatrix, CacheEntry>>();
+            for (component, entry) in guard.iter() {
                 match entry {
                     CacheEntry::Processing => profile.processing += 1,
                     CacheEntry::Done(_) => profile.done += 1,
                 }
-                profile.estimated_bytes += estimate_cache_entry_bytes(game);
+                profile.estimated_bytes += estimate_cache_entry_bytes(component);
             }
         }
         profile
@@ -425,22 +488,21 @@ impl ShardedCache {
 
     fn clone_done_into_shards(&self, shard_count: usize) -> Self {
         let copied = Self::new(shard_count);
-        for shard in &self.shards {
-            let guard = shard.lock().expect("cache shard poisoned");
-            for (game, entry) in guard.iter() {
+        for index in 0..self.shards.len() {
+            let guard = self.lock_shard(index);
+            for (component, entry) in guard.iter() {
                 if let CacheEntry::Done(nimber) = entry {
-                    copied.insert_done(game.clone(), *nimber);
+                    copied.insert_done(component.clone(), *nimber);
                 }
             }
         }
         copied
     }
 
-    fn insert_done(&self, game: CanonicalGame, nimber: usize) {
-        self.shards[self.shard(&game)]
-            .lock()
-            .expect("cache shard poisoned")
-            .insert(game, CacheEntry::Done(nimber));
+    fn insert_done(&self, component: BitMatrix, nimber: usize) {
+        let shard = self.shard(&component);
+        self.lock_shard(shard)
+            .insert(component, CacheEntry::Done(nimber));
     }
 
     fn save_to(&self, path: impl AsRef<Path>) -> io::Result<CacheIoReport> {
@@ -448,21 +510,21 @@ impl ShardedCache {
         file.write_all(CACHE_FILE_MAGIC)?;
         write_u64(&mut file, 0)?;
         let mut entries = 0;
-        for shard in &self.shards {
+        for index in 0..self.shards.len() {
             let shard_entries: Vec<_> = {
-                let guard = shard.lock().expect("cache shard poisoned");
+                let guard = self.lock_shard(index);
                 guard
                     .iter()
-                    .filter_map(|(game, entry)| match entry {
-                        CacheEntry::Done(nimber) => Some((game.clone(), *nimber)),
+                    .filter_map(|(component, entry)| match entry {
+                        CacheEntry::Done(nimber) => Some((component.clone(), *nimber)),
                         CacheEntry::Processing => None,
                     })
                     .collect()
             };
 
             entries += shard_entries.len();
-            for (game, nimber) in shard_entries {
-                write_cache_entry(&mut file, &game, nimber)?;
+            for (component, nimber) in shard_entries {
+                write_cache_entry(&mut file, &component, nimber)?;
             }
         }
         file.flush()?;
@@ -486,55 +548,61 @@ impl ShardedCache {
         let entries = read_usize(&mut file, "cache entry count")?;
         self.clear();
         for _ in 0..entries {
-            let (game, nimber) = read_cache_entry(&mut file)?;
-            self.insert_done(game, nimber);
+            let (component, nimber) = read_cache_entry(&mut file)?;
+            self.insert_done(component, nimber);
         }
         Ok(CacheIoReport { entries })
     }
 
     fn clear(&self) {
-        for shard in &self.shards {
-            shard.lock().expect("cache shard poisoned").clear();
+        for index in 0..self.shards.len() {
+            self.lock_shard(index).clear();
         }
     }
 
     fn clear_processing(&self) {
-        for shard in &self.shards {
-            shard
-                .lock()
-                .expect("cache shard poisoned")
+        for index in 0..self.shards.len() {
+            self.lock_shard(index)
                 .retain(|_, entry| matches!(entry, CacheEntry::Done(_)));
         }
     }
 
-    fn shard(&self, game: &CanonicalGame) -> usize {
+    fn add_diagnostics_to(&self, stats: &mut EvaluatorStats) {
+        self.diagnostics.add_to(stats);
+    }
+
+    fn lock_shard(&self, shard: usize) -> MutexGuard<'_, HashMap<BitMatrix, CacheEntry>> {
+        let start = Instant::now();
+        let guard = self.shards[shard].lock().expect("cache shard poisoned");
+        let waited = start.elapsed().as_micros().min(usize::MAX as u128) as usize;
+        self.diagnostics.lock_ops.fetch_add(1, Ordering::Relaxed);
+        self.diagnostics
+            .lock_wait_micros
+            .fetch_add(waited, Ordering::Relaxed);
+        guard
+    }
+
+    fn shard(&self, component: &BitMatrix) -> usize {
         let mut hasher = DefaultHasher::new();
-        game.hash(&mut hasher);
+        component.hash(&mut hasher);
         hasher.finish() as usize % self.shards.len()
     }
 }
 
 fn write_cache_entry(
     writer: &mut impl Write,
-    game: &CanonicalGame,
+    component: &BitMatrix,
     nimber: usize,
 ) -> io::Result<()> {
     write_u64(writer, nimber)?;
-    write_u64(writer, game.components().len())?;
-    for component in game.components() {
-        write_matrix(writer, component)?;
-    }
+    write_matrix(writer, component)?;
     Ok(())
 }
 
-fn read_cache_entry(reader: &mut impl Read) -> io::Result<(CanonicalGame, usize)> {
+fn read_cache_entry(reader: &mut impl Read) -> io::Result<(BitMatrix, usize)> {
     let nimber = read_usize(reader, "nimber")?;
-    let component_count = read_usize(reader, "component count")?;
-    let mut components = Vec::with_capacity(component_count);
-    for _ in 0..component_count {
-        components.push(read_matrix(reader)?);
-    }
-    Ok((CanonicalGame::from_canonical_components(components), nimber))
+    let component = read_matrix(reader)?;
+    Ok((component, nimber))
 }
 
 fn write_matrix(writer: &mut impl Write, matrix: &BitMatrix) -> io::Result<()> {
@@ -589,16 +657,18 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 }
 
 fn evict_done_entries(
-    guard: &mut HashMap<CanonicalGame, CacheEntry>,
+    guard: &mut HashMap<BitMatrix, CacheEntry>,
     target: usize,
-    new_game_hash: u64,
+    new_component_hash: u64,
 ) {
     while guard.len() > target {
         let Some(victim) = guard
             .iter()
             .filter(|(_, entry)| matches!(entry, CacheEntry::Done(_)))
-            .max_by_key(|(game, _)| stable_game_hash(game) ^ new_game_hash.rotate_left(17))
-            .map(|(game, _)| game.clone())
+            .max_by_key(|(component, _)| {
+                stable_matrix_hash(component) ^ new_component_hash.rotate_left(17)
+            })
+            .map(|(component, _)| component.clone())
         else {
             return;
         };
@@ -606,22 +676,10 @@ fn evict_done_entries(
     }
 }
 
-fn estimate_cache_entry_bytes(game: &CanonicalGame) -> usize {
-    std::mem::size_of::<CanonicalGame>()
+fn estimate_cache_entry_bytes(component: &BitMatrix) -> usize {
+    std::mem::size_of::<BitMatrix>()
         + std::mem::size_of::<CacheEntry>()
-        + game
-            .components()
-            .iter()
-            .map(BitMatrix::estimated_bytes)
-            .sum::<usize>()
-}
-
-fn stable_game_hash(game: &CanonicalGame) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for component in game.components() {
-        hash = stable_matrix_hash_from(hash, component);
-    }
-    hash
+        + component.estimated_bytes()
 }
 
 fn stable_matrix_hash(matrix: &BitMatrix) -> u64 {
@@ -758,11 +816,13 @@ where
     }
 
     pub fn cached_nimber_of_canonical(&self, game: &CanonicalGame) -> Option<usize> {
-        self.cache.get_done(game)
+        self.cached_nimber_of_components(game)
     }
 
     pub fn publish_nimber_of_canonical(&self, game: CanonicalGame, nimber: usize) {
-        self.cache_result(game, nimber);
+        if let [component] = game.components() {
+            self.cache_result(component.clone(), nimber);
+        }
     }
 
     pub fn cache_len(&self) -> usize {
@@ -782,7 +842,9 @@ where
     }
 
     pub fn stats(&self) -> EvaluatorStats {
-        self.stats.snapshot()
+        let mut stats = self.stats.snapshot();
+        self.cache.add_diagnostics_to(&mut stats);
+        stats
     }
 
     pub fn progress(&self) -> EvaluatorProgress {
@@ -851,20 +913,20 @@ where
         )
     }
 
-    fn nimber_inner(&self, game: &CanonicalGame, cancel: Option<&AtomicBool>) -> Option<usize> {
+    fn nimber_inner(&self, component: &BitMatrix, cancel: Option<&AtomicBool>) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
-        match self.try_nimber(game, cancel, EvaluationPolicy::Serial, 0)? {
+        match self.try_component_nimber(component, cancel, EvaluationPolicy::Serial, 0)? {
             Evaluation::Ready { nimber, .. } => nimber,
             Evaluation::Busy => {
-                if let Some(nimber) = self.cache.get_done(game) {
+                if let Some(nimber) = self.cache.get_done(component) {
                     self.stats
                         .completed_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                     return Some(nimber);
                 }
-                self.evaluate_duplicate(game, cancel, 0)?
+                self.evaluate_duplicate_component(component, cancel, 0)?
             }
         }
         .into()
@@ -882,7 +944,12 @@ where
             return Some(0);
         }
 
-        Some(match self.cache.probe(game) {
+        if game.components().len() > 1 {
+            return self.nimber_of_components(game, cancel, EvaluationPolicy::Serial, 0);
+        }
+        let component = &game.components()[0];
+
+        Some(match self.cache.probe(component) {
             CacheProbe::Done(nimber) => {
                 self.stats
                     .completed_cache_hits
@@ -891,24 +958,25 @@ where
             }
             CacheProbe::Busy => {
                 self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
-                if let Some(nimber) = self.cache.get_done(game) {
+                if let Some(nimber) = self.cache.get_done(component) {
                     self.stats
                         .completed_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                     nimber
                 } else {
-                    self.evaluate_duplicate(game, cancel, 0)?
+                    self.evaluate_duplicate_component(component, cancel, 0)?
                 }
             }
             CacheProbe::Claimed => {
                 self.stats
                     .unique_positions_claimed
                     .fetch_add(1, Ordering::Relaxed);
+                self.stats.record_fresh_claim_depth(0);
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
-                let nimber = self.compute_position_cooperative_root(game, cancel)?;
-                self.cache_result(game.clone(), nimber);
+                let nimber = self.compute_component_cooperative_root(component, cancel)?;
+                self.cache_result(component.clone(), nimber);
                 nimber
             }
         })
@@ -931,7 +999,27 @@ where
             });
         }
 
-        Some(match self.cache.probe(game) {
+        if game.components().len() > 1 {
+            return Some(Evaluation::Ready {
+                nimber: self.nimber_of_components(game, cancel, policy, depth)?,
+                claimed: false,
+            });
+        }
+        self.try_component_nimber(&game.components()[0], cancel, policy, depth)
+    }
+
+    fn try_component_nimber(
+        &self,
+        component: &BitMatrix,
+        cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
+        depth: usize,
+    ) -> Option<Evaluation> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+
+        Some(match self.cache.probe(component) {
             CacheProbe::Done(nimber) => {
                 self.stats
                     .completed_cache_hits
@@ -949,11 +1037,12 @@ where
                 self.stats
                     .unique_positions_claimed
                     .fetch_add(1, Ordering::Relaxed);
+                self.stats.record_fresh_claim_depth(depth);
                 self.stats
                     .evaluation_attempts
                     .fetch_add(1, Ordering::Relaxed);
-                let nimber = self.compute_position(game, cancel, policy, depth)?;
-                self.cache_result(game.clone(), nimber);
+                let nimber = self.compute_component(component, cancel, policy, depth)?;
+                self.cache_result(component.clone(), nimber);
                 Evaluation::Ready {
                     nimber,
                     claimed: true,
@@ -962,9 +1051,9 @@ where
         })
     }
 
-    fn compute_position(
+    fn compute_component(
         &self,
-        game: &CanonicalGame,
+        component: &BitMatrix,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
         depth: usize,
@@ -972,39 +1061,38 @@ where
         if is_cancelled(cancel) {
             return None;
         }
-        if game.components().len() > 1 {
-            self.nimber_of_components(game, cancel, policy, depth)
-        } else {
-            self.nimber_of_component(&game.components()[0], cancel, policy, depth)
-        }
+        self.stats.record_component_eval_depth(depth);
+        self.evaluate_component_uncached(component, cancel, policy, depth)
     }
 
-    fn compute_position_cooperative_root(
+    fn compute_component_cooperative_root(
         &self,
-        game: &CanonicalGame,
+        component: &BitMatrix,
         cancel: Option<&AtomicBool>,
     ) -> Option<usize> {
         if is_cancelled(cancel) {
             return None;
         }
-        if game.components().len() > 1 {
-            return self.nimber_of_components(game, cancel, EvaluationPolicy::Serial, 0);
-        }
-        self.nimber_of_component_cooperative_root(&game.components()[0], cancel)
+        self.evaluate_component_cooperative_root_uncached(component, cancel)
     }
 
-    fn evaluate_duplicate(
+    fn evaluate_duplicate_component(
         &self,
-        game: &CanonicalGame,
+        component: &BitMatrix,
         cancel: Option<&AtomicBool>,
         depth: usize,
     ) -> Option<usize> {
-        self.evaluate_duplicate_with_policy(game, cancel, EvaluationPolicy::Serial, depth)
+        self.evaluate_duplicate_component_with_policy(
+            component,
+            cancel,
+            EvaluationPolicy::Serial,
+            depth,
+        )
     }
 
-    fn evaluate_duplicate_with_policy(
+    fn evaluate_duplicate_component_with_policy(
         &self,
-        game: &CanonicalGame,
+        component: &BitMatrix,
         cancel: Option<&AtomicBool>,
         policy: EvaluationPolicy,
         depth: usize,
@@ -1018,8 +1106,16 @@ where
         self.stats
             .evaluation_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let nimber = self.compute_position(game, cancel, policy, depth)?;
-        self.cache_result(game.clone(), nimber);
+        let nimber = self.compute_component(component, cancel, policy, depth)?;
+        self.cache_result(component.clone(), nimber);
+        Some(nimber)
+    }
+
+    fn cached_nimber_of_components(&self, game: &CanonicalGame) -> Option<usize> {
+        let mut nimber = 0;
+        for component in game.components() {
+            nimber ^= self.cache.get_done(component)?;
+        }
         Some(nimber)
     }
 
@@ -1031,17 +1127,16 @@ where
         depth: usize,
     ) -> Option<usize> {
         let mut nimber = 0;
-        for index in 0..game.components().len() {
-            let component = game.component(index);
+        for component in game.components() {
             nimber ^= match policy {
-                EvaluationPolicy::Serial => self.nimber_inner(&component, cancel)?,
+                EvaluationPolicy::Serial => self.nimber_inner(component, cancel)?,
                 EvaluationPolicy::CooperativeAssist => {
-                    match self.try_nimber(&component, cancel, policy, depth + 1)? {
+                    match self.try_component_nimber(component, cancel, policy, depth + 1)? {
                         Evaluation::Ready { nimber, .. } => nimber,
                         Evaluation::Busy => {
                             self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
-                            self.evaluate_duplicate_with_policy(
-                                &component,
+                            self.evaluate_duplicate_component_with_policy(
+                                component,
                                 cancel,
                                 policy,
                                 depth + 1,
@@ -1054,7 +1149,7 @@ where
         Some(nimber)
     }
 
-    fn nimber_of_component(
+    fn evaluate_component_uncached(
         &self,
         component: &BitMatrix,
         cancel: Option<&AtomicBool>,
@@ -1092,7 +1187,7 @@ where
         Some(worker.reachable.mex())
     }
 
-    fn nimber_of_component_cooperative_root(
+    fn evaluate_component_cooperative_root_uncached(
         &self,
         component: &BitMatrix,
         cancel: Option<&AtomicBool>,
@@ -1282,14 +1377,14 @@ where
                             EvaluationPolicy::Serial => worker.pending.push(successor),
                             EvaluationPolicy::CooperativeAssist => {
                                 self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
-                                if let Some(nimber) = self.cache.get_done(&successor) {
+                                if let Some(nimber) = self.cached_nimber_of_components(&successor) {
                                     self.stats
                                         .completed_cache_hits
                                         .fetch_add(1, Ordering::Relaxed);
                                     self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
                                     worker.reachable.insert(nimber);
                                 } else {
-                                    let Some(nimber) = self.evaluate_duplicate_with_policy(
+                                    let Some(nimber) = self.evaluate_duplicate_game_with_policy(
                                         &successor,
                                         context.cancel,
                                         context.policy,
@@ -1331,14 +1426,19 @@ where
                 worker.cancelled = true;
                 return;
             }
-            let nimber = if let Some(nimber) = self.cache.get_done(&game) {
+            let nimber = if let Some(nimber) = self.cached_nimber_of_components(&game) {
                 self.stats
                     .completed_cache_hits
                     .fetch_add(1, Ordering::Relaxed);
                 self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
                 nimber
             } else {
-                let Some(nimber) = self.evaluate_duplicate(&game, cancel, 0) else {
+                let Some(nimber) = self.evaluate_duplicate_game_with_policy(
+                    &game,
+                    cancel,
+                    EvaluationPolicy::Serial,
+                    0,
+                ) else {
                     worker.cancelled = true;
                     return;
                 };
@@ -1348,9 +1448,23 @@ where
         }
     }
 
-    fn cache_result(&self, game: CanonicalGame, nimber: usize) {
+    fn evaluate_duplicate_game_with_policy(
+        &self,
+        game: &CanonicalGame,
+        cancel: Option<&AtomicBool>,
+        policy: EvaluationPolicy,
+        depth: usize,
+    ) -> Option<usize> {
+        if let [component] = game.components() {
+            self.evaluate_duplicate_component_with_policy(component, cancel, policy, depth)
+        } else {
+            self.nimber_of_components(game, cancel, policy, depth)
+        }
+    }
+
+    fn cache_result(&self, component: BitMatrix, nimber: usize) {
         if self.cache.insert_if_absent(
-            game,
+            component,
             nimber,
             self.config.max_cache_entries,
             self.config.cache_low_watermark,
@@ -1668,6 +1782,20 @@ mod tests {
         result
     }
 
+    fn format_depth_buckets(buckets: [usize; DEPTH_BUCKETS]) -> String {
+        format!(
+            "0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7+:{}",
+            buckets[0],
+            buckets[1],
+            buckets[2],
+            buckets[3],
+            buckets[4],
+            buckets[5],
+            buckets[6],
+            buckets[7]
+        )
+    }
+
     #[test]
     fn single_row_positions_have_heap_nimbers() {
         let solver = DfsSolver::default();
@@ -1862,6 +1990,12 @@ mod tests {
         } else {
             stats.successor_revisit_groups_with_busy as f64 * 100.0 / stats.group_revisits as f64
         };
+        let cache_wait_ms = stats.cache_lock_wait_micros as f64 / 1000.0;
+        let cache_wait_ns_per_lock = if stats.cache_lock_ops == 0 {
+            0.0
+        } else {
+            stats.cache_lock_wait_micros as f64 * 1000.0 / stats.cache_lock_ops as f64
+        };
         println!("\ntotal seconds: {:.3}", suite_elapsed.as_secs_f64());
         println!("final cache entries: {}", evaluator.cache_len());
         println!(
@@ -1875,6 +2009,20 @@ mod tests {
             new_group_rate,
             busy_group_rate,
             revisit_busy_rate,
+        );
+        println!(
+            "cache: probe/get/insert {}/{}/{}  locks {}  wait {:.1}ms {:.0}ns/lock",
+            stats.cache_probe_ops,
+            stats.cache_get_ops,
+            stats.cache_insert_ops,
+            stats.cache_lock_ops,
+            cache_wait_ms,
+            cache_wait_ns_per_lock,
+        );
+        println!(
+            "depth: fresh [{}]  eval [{}]",
+            format_depth_buckets(stats.fresh_claim_depths),
+            format_depth_buckets(stats.component_eval_depths)
         );
         println!("final stats: {stats:#?}");
         assert_eq!(
@@ -1917,7 +2065,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "nim_light_cache_test_{}_{}.bin",
             std::process::id(),
-            stable_game_hash(&CanonicalGame::from_matrix(&heap(1)))
+            stable_matrix_hash(&heap(1))
         ));
         let _ = fs::remove_file(&path);
 
@@ -1967,14 +2115,14 @@ mod tests {
     #[test]
     fn cache_claims_processing_positions_before_publishing() {
         let cache = ShardedCache::new(4);
-        let game = CanonicalGame::from_matrix(&heap(2));
+        let component = CanonicalGame::from_matrix(&heap(2)).components()[0].clone();
 
-        assert_eq!(cache.probe(&game), CacheProbe::Claimed);
-        assert_eq!(cache.probe(&game), CacheProbe::Busy);
-        assert_eq!(cache.get_done(&game), None);
-        assert!(cache.insert_if_absent(game.clone(), 2, None, 0.95));
-        assert_eq!(cache.probe(&game), CacheProbe::Done(2));
-        assert!(!cache.insert_if_absent(game, 2, None, 0.95));
+        assert_eq!(cache.probe(&component), CacheProbe::Claimed);
+        assert_eq!(cache.probe(&component), CacheProbe::Busy);
+        assert_eq!(cache.get_done(&component), None);
+        assert!(cache.insert_if_absent(component.clone(), 2, None, 0.95));
+        assert_eq!(cache.probe(&component), CacheProbe::Done(2));
+        assert!(!cache.insert_if_absent(component, 2, None, 0.95));
     }
 
     #[test]
