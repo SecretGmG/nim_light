@@ -24,7 +24,7 @@ use crate::{
     board::{Axis, Cell, Maze},
     evaluator::{
         DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress, ToggleableSymmetryFinder,
-        recommended_cache_shards,
+        recommended_cache_shards, stats_collection_enabled,
     },
     game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
     solver::{RankCanonicalizer, compile_maze},
@@ -1137,6 +1137,15 @@ fn render_editor(
 
 fn render_progress(stdout: &mut impl Write, view: ProgressView) -> io::Result<()> {
     let progress = view.progress;
+    if !stats_collection_enabled() {
+        return queue!(
+            stdout,
+            Print(format!(
+                "elapsed {:.2?}  detailed solver stats disabled in this benchmark build\r\n",
+                progress.elapsed
+            ))
+        );
+    }
     let stats = progress.stats;
     let busy = stats.processing_hits.max(1) as f64;
     let deferral_rate = stats.group_deferrals as f64 * 100.0 / busy;

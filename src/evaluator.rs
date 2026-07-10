@@ -23,6 +23,11 @@ use crate::{
 };
 
 const CACHE_FILE_MAGIC: &[u8; 8] = b"NLCACH02";
+const COLLECT_STATS: bool = cfg!(test);
+
+pub const fn stats_collection_enabled() -> bool {
+    COLLECT_STATS
+}
 
 /// A conservative zero certificate evaluated after a cache miss.
 pub trait SymmetryFinder: Send + Sync {
@@ -182,6 +187,9 @@ struct AtomicEvaluatorStats {
 
 impl AtomicEvaluatorStats {
     fn snapshot(&self) -> EvaluatorStats {
+        if !COLLECT_STATS {
+            return EvaluatorStats::default();
+        }
         EvaluatorStats {
             evaluation_attempts: self.evaluation_attempts.load(Ordering::Relaxed),
             completed_cache_hits: self.completed_cache_hits.load(Ordering::Relaxed),
@@ -212,7 +220,87 @@ impl AtomicEvaluatorStats {
         }
     }
 
+    #[inline]
+    fn increment(counter: &AtomicUsize) {
+        if COLLECT_STATS {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn completed_cache_hit(&self) {
+        Self::increment(&self.completed_cache_hits);
+    }
+
+    #[inline]
+    fn unique_position_claimed(&self) {
+        Self::increment(&self.unique_positions_claimed);
+    }
+
+    #[inline]
+    fn completed_position(&self) {
+        Self::increment(&self.completed_positions);
+    }
+
+    #[inline]
+    fn duplicate_publish_race(&self) {
+        Self::increment(&self.duplicate_publish_races);
+    }
+
+    #[inline]
+    fn processing_hit(&self) {
+        Self::increment(&self.processing_hits);
+    }
+
+    #[inline]
+    fn deferred_resolved(&self) {
+        Self::increment(&self.deferred_resolved);
+    }
+
+    #[inline]
+    fn forced_duplicate_evaluation(&self) {
+        Self::increment(&self.forced_duplicate_evaluations);
+    }
+
+    #[inline]
+    fn symmetry_zero_certificate(&self) {
+        Self::increment(&self.symmetry_zero_certificates);
+    }
+
+    #[inline]
+    fn cooperative_region(&self) {
+        Self::increment(&self.cooperative_regions);
+    }
+
+    #[inline]
+    fn cooperative_worker_entry(&self) {
+        Self::increment(&self.cooperative_worker_entries);
+    }
+
+    #[inline]
+    fn deferred_descent(&self) {
+        Self::increment(&self.deferred_descents);
+    }
+
+    #[inline]
+    fn group_deferral(&self) {
+        Self::increment(&self.group_deferrals);
+    }
+
+    #[inline]
+    fn group_revisit(&self) {
+        Self::increment(&self.group_revisits);
+    }
+
+    #[inline]
+    fn evaluation_attempt(&self) {
+        Self::increment(&self.evaluation_attempts);
+    }
+
     fn observe_active_workers(&self, active: usize) {
+        if !COLLECT_STATS {
+            return;
+        }
         let mut previous = self.max_active_workers.load(Ordering::Relaxed);
         while active > previous {
             match self.max_active_workers.compare_exchange_weak(
@@ -228,12 +316,18 @@ impl AtomicEvaluatorStats {
     }
 
     fn worker_started(&self) {
+        if !COLLECT_STATS {
+            return;
+        }
         let active = self.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
         self.active_worker_clock.lock().unwrap().set_active(active);
         self.observe_active_workers(active);
     }
 
     fn worker_finished(&self) {
+        if !COLLECT_STATS {
+            return;
+        }
         let active = self
             .active_workers
             .fetch_sub(1, Ordering::Relaxed)
@@ -242,6 +336,9 @@ impl AtomicEvaluatorStats {
     }
 
     fn flush_distribution(&self, distribution: DistributionStats) {
+        if !COLLECT_STATS {
+            return;
+        }
         self.successor_groups_started
             .fetch_add(distribution.successor_groups_started, Ordering::Relaxed);
         self.successor_group_successors
@@ -775,6 +872,13 @@ where
         let elapsed = self.created_at.elapsed();
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let stats = self.stats();
+        if !COLLECT_STATS {
+            return EvaluatorProgress {
+                elapsed,
+                stats,
+                ..EvaluatorProgress::default()
+            };
+        }
         let cache = self.cache.profile();
         EvaluatorProgress {
             elapsed,
@@ -795,6 +899,13 @@ where
         let elapsed = self.created_at.elapsed();
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let stats = self.stats();
+        if !COLLECT_STATS {
+            return EvaluatorProgress {
+                elapsed,
+                stats,
+                ..EvaluatorProgress::default()
+            };
+        }
         EvaluatorProgress {
             elapsed,
             cache_entries: self.cache.len(),
@@ -845,9 +956,7 @@ where
             Evaluation::Ready { nimber, .. } => nimber,
             Evaluation::Busy => {
                 if let Some(nimber) = self.cache.get_done(component) {
-                    self.stats
-                        .completed_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats.completed_cache_hit();
                     return Some(nimber);
                 }
                 self.evaluate_duplicate_component(component, cancel, 0)?
@@ -875,29 +984,21 @@ where
 
         Some(match self.cache.probe(component) {
             CacheProbe::Done(nimber) => {
-                self.stats
-                    .completed_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.completed_cache_hit();
                 nimber
             }
             CacheProbe::Busy => {
-                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.processing_hit();
                 if let Some(nimber) = self.cache.get_done(component) {
-                    self.stats
-                        .completed_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats.completed_cache_hit();
                     nimber
                 } else {
                     self.evaluate_duplicate_component(component, cancel, 0)?
                 }
             }
             CacheProbe::Claimed => {
-                self.stats
-                    .unique_positions_claimed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .evaluation_attempts
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.unique_position_claimed();
+                self.stats.evaluation_attempt();
                 let nimber = self.compute_component_cooperative_root(component, cancel)?;
                 self.cache_result(component.clone(), nimber);
                 nimber
@@ -944,25 +1045,19 @@ where
 
         Some(match self.cache.probe(component) {
             CacheProbe::Done(nimber) => {
-                self.stats
-                    .completed_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.completed_cache_hit();
                 Evaluation::Ready {
                     nimber,
                     claimed: false,
                 }
             }
             CacheProbe::Busy => {
-                self.stats.processing_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.processing_hit();
                 Evaluation::Busy
             }
             CacheProbe::Claimed => {
-                self.stats
-                    .unique_positions_claimed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .evaluation_attempts
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.unique_position_claimed();
+                self.stats.evaluation_attempt();
                 let nimber = self.compute_component(component, cancel, policy, depth)?;
                 self.cache_result(component.clone(), nimber);
                 Evaluation::Ready {
@@ -1021,12 +1116,8 @@ where
         if is_cancelled(cancel) {
             return None;
         }
-        self.stats
-            .forced_duplicate_evaluations
-            .fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .evaluation_attempts
-            .fetch_add(1, Ordering::Relaxed);
+        self.stats.forced_duplicate_evaluation();
+        self.stats.evaluation_attempt();
         let nimber = self.compute_component(component, cancel, policy, depth)?;
         self.cache_result(component.clone(), nimber);
         Some(nimber)
@@ -1055,7 +1146,7 @@ where
                     match self.try_component_nimber(component, cancel, policy, depth + 1)? {
                         Evaluation::Ready { nimber, .. } => nimber,
                         Evaluation::Busy => {
-                            self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
+                            self.stats.deferred_descent();
                             self.evaluate_duplicate_component_with_policy(
                                 component,
                                 cancel,
@@ -1081,9 +1172,7 @@ where
             return None;
         }
         if self.symmetry_finder.proves_zero(component) {
-            self.stats
-                .symmetry_zero_certificates
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.symmetry_zero_certificate();
             return Some(0);
         }
 
@@ -1117,9 +1206,7 @@ where
             return None;
         }
         if self.symmetry_finder.proves_zero(component) {
-            self.stats
-                .symmetry_zero_certificates
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.symmetry_zero_certificate();
             return Some(0);
         }
 
@@ -1127,18 +1214,14 @@ where
         let result = Mutex::new(WorkerResult::new(bound));
         let worker_count = self.pool.current_num_threads().max(1);
 
-        self.stats
-            .cooperative_regions
-            .fetch_add(1, Ordering::Relaxed);
+        self.stats.cooperative_region();
 
         rayon::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|_| {
                     let mut local = WorkerResult::new(bound);
                     let worker_seed = rayon::current_thread_index().unwrap_or(0);
-                    self.stats
-                        .cooperative_worker_entries
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats.cooperative_worker_entry();
                     self.stats.worker_started();
                     self.evaluate_successor_groups_with_seed(
                         self.generator.successor_groups(component),
@@ -1228,7 +1311,7 @@ where
     {
         for index in StridedIndices::new(deferred.len(), seed) {
             let group = deferred[index];
-            self.stats.group_revisits.fetch_add(1, Ordering::Relaxed);
+            self.stats.group_revisit();
             self.evaluate_successor_group_with_deferral(
                 groups,
                 group,
@@ -1283,7 +1366,7 @@ where
                 Some(Evaluation::Busy) => {
                     had_busy = true;
                     if context.defer_mode == DeferMode::Fresh {
-                        self.stats.group_deferrals.fetch_add(1, Ordering::Relaxed);
+                        self.stats.group_deferral();
                         deferred.push(group.resume_at(visited));
                         worker.record_successor_group(
                             successor_count,
@@ -1297,12 +1380,10 @@ where
                         match context.policy {
                             EvaluationPolicy::Serial => worker.pending.push(successor),
                             EvaluationPolicy::CooperativeAssist => {
-                                self.stats.deferred_descents.fetch_add(1, Ordering::Relaxed);
+                                self.stats.deferred_descent();
                                 if let Some(nimber) = self.cached_nimber_of_components(&successor) {
-                                    self.stats
-                                        .completed_cache_hits
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
+                                    self.stats.completed_cache_hit();
+                                    self.stats.deferred_resolved();
                                     worker.reachable.insert(nimber);
                                 } else {
                                     let Some(nimber) = self.evaluate_duplicate_game_with_policy(
@@ -1348,10 +1429,8 @@ where
                 return;
             }
             let nimber = if let Some(nimber) = self.cached_nimber_of_components(&game) {
-                self.stats
-                    .completed_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats.deferred_resolved.fetch_add(1, Ordering::Relaxed);
+                self.stats.completed_cache_hit();
+                self.stats.deferred_resolved();
                 nimber
             } else {
                 let Some(nimber) = self.evaluate_duplicate_game_with_policy(
@@ -1390,13 +1469,9 @@ where
             self.config.max_cache_entries,
             self.config.cache_low_watermark,
         ) {
-            self.stats
-                .completed_positions
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.completed_position();
         } else {
-            self.stats
-                .duplicate_publish_races
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.duplicate_publish_race();
         }
     }
 }
@@ -1581,6 +1656,9 @@ impl WorkerResult {
         had_busy: bool,
         revisit_busy: bool,
     ) {
+        if !COLLECT_STATS {
+            return;
+        }
         self.distribution.successor_groups_started += 1;
         self.distribution.successor_group_successors += successor_count;
         self.distribution.successor_groups_with_new_claim += usize::from(had_new_claim);
