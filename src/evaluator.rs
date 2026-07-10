@@ -402,6 +402,12 @@ pub struct CacheIoReport {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheSnapshot {
+    pub entries: usize,
+    pub estimated_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CacheProfile {
     entries: usize,
     done: usize,
@@ -850,6 +856,14 @@ where
 
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    pub fn cache_snapshot(&self) -> CacheSnapshot {
+        let profile = self.cache.profile();
+        CacheSnapshot {
+            entries: profile.entries,
+            estimated_bytes: profile.estimated_bytes,
+        }
     }
 
     pub fn clear_cache(&self) {

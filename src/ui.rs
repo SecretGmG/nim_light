@@ -540,6 +540,8 @@ struct EvaluationReport {
     matrix_rows: usize,
     matrix_cols: usize,
     matrix_nodes: usize,
+    cache_entries: usize,
+    cache_bytes: usize,
 }
 
 fn edit_board(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<PostGame> {
@@ -687,12 +689,15 @@ fn evaluate_editor(stdout: &mut impl Write, editor: &mut Editor) -> io::Result<(
 
     handle.join().expect("evaluator worker panicked");
     if let Some(nimber) = nimber {
+        let cache = evaluator.cache_snapshot();
         editor.last_evaluation = Some(EvaluationReport {
             nimber,
             elapsed: started.elapsed(),
             matrix_rows: report_shape.0,
             matrix_cols: report_shape.1,
             matrix_nodes: report_shape.2,
+            cache_entries: cache.entries,
+            cache_bytes: cache.estimated_bytes,
         });
         editor.nimber_is_current = true;
         editor.last_cancelled = false;
@@ -1071,11 +1076,7 @@ fn render_editor(
     render_editor_maze(stdout, editor)?;
     queue!(stdout, Print("\r\n"))?;
 
-    let progress = computing
-        .map(|(progress, _)| progress)
-        .unwrap_or_else(|| ProgressView::fresh(editor.evaluator.progress()));
-
-    if let Some((_, elapsed)) = computing {
+    if let Some((progress, elapsed)) = computing {
         queue!(
             stdout,
             SetForegroundColor(Color::Yellow),
@@ -1083,6 +1084,7 @@ fn render_editor(
             ResetColor,
             Print(format!("elapsed: {:.2?}    Esc/x: cancel\r\n", elapsed))
         )?;
+        render_progress(stdout, progress)?;
     } else if editor.last_cancelled {
         queue!(
             stdout,
@@ -1119,7 +1121,12 @@ fn render_editor(
                 "previous compiled matrix: {} × {} with {} nodes\r\n",
                 report.matrix_rows, report.matrix_cols, report.matrix_nodes
             )),
-            Print(format!("previous elapsed: {:.2?}\r\n", report.elapsed))
+            Print(format!("elapsed: {:.2?}\r\n", report.elapsed)),
+            Print(format!(
+                "cache: {} entries (~{})\r\n",
+                report.cache_entries,
+                format_bytes(report.cache_bytes)
+            ))
         )?;
     } else {
         queue!(
@@ -1127,7 +1134,6 @@ fn render_editor(
             Print("nimber: not computed for this edit state\r\n")
         )?;
     }
-    render_progress(stdout, progress)?;
     if let Some(status) = &editor.cache_status {
         queue!(
             stdout,
