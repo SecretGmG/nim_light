@@ -17,7 +17,7 @@ use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 
 use crate::{
     board::BitMatrix,
-    solver::{CanonicalGame, PseudoCanonicalizer},
+    solver::{CanonicalGame, RankCanonicalizer},
     successor::{CanonicalMoveGenerator, IndexedSuccessorGroups, SuccessorGenerator},
     symmetry::InvolutionSymmetryFinder,
 };
@@ -1589,13 +1589,12 @@ impl NimberSet {
     }
 }
 
-pub type DfsSolver =
-    Evaluator<CanonicalMoveGenerator<PseudoCanonicalizer>, InvolutionSymmetryFinder>;
+pub type DfsSolver = Evaluator<CanonicalMoveGenerator<RankCanonicalizer>, InvolutionSymmetryFinder>;
 
 impl Default for DfsSolver {
     fn default() -> Self {
         Self::new(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            CanonicalMoveGenerator::new(RankCanonicalizer::default()),
             InvolutionSymmetryFinder,
         )
     }
@@ -1755,23 +1754,52 @@ mod tests {
     #[test]
     #[ignore = "manual shared-cache performance benchmark"]
     fn shared_cache_benchmark_suite() {
+        run_shared_cache_benchmark_suite(
+            "current",
+            Evaluator::with_config(
+                CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                InvolutionSymmetryFinder,
+                EvaluatorConfig {
+                    threads: Some(8),
+                    ..EvaluatorConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    #[ignore = "manual shared-cache rank-canonicalizer performance benchmark"]
+    fn shared_cache_rank_canonicalizer_benchmark_suite() {
+        run_shared_cache_benchmark_suite(
+            "rank",
+            Evaluator::with_config(
+                CanonicalMoveGenerator::new(crate::solver::RankCanonicalizer::default()),
+                InvolutionSymmetryFinder,
+                EvaluatorConfig {
+                    threads: Some(8),
+                    ..EvaluatorConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+    }
+
+    fn run_shared_cache_benchmark_suite<G>(
+        label: &str,
+        evaluator: Evaluator<G, InvolutionSymmetryFinder>,
+    ) where
+        G: SuccessorGenerator,
+    {
         let games = [
             ("dense 5x5", dense_grid(5)),
             ("dense 3x7", dense_rectangle(3, 7)),
             ("spiral 5x5", spiral_maze_game(5, 5)),
             ("chambers 5x7", chambered_maze_game()),
         ];
-        let evaluator = Evaluator::with_config(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
-            InvolutionSymmetryFinder,
-            EvaluatorConfig {
-                threads: Some(8),
-                ..EvaluatorConfig::default()
-            },
-        )
-        .unwrap();
         let suite_start = Instant::now();
 
+        println!("\n{label} canonicalizer");
         println!(
             "game          matrix     nodes  nimber  seconds  cache  attempts  hits  unique  forced  sym"
         );

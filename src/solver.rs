@@ -31,6 +31,37 @@ impl Canonicalizer for PseudoCanonicalizer {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RankCanonicalizer {
+    rounds: usize,
+}
+
+impl RankCanonicalizer {
+    pub const fn new(rounds: usize) -> Self {
+        Self { rounds }
+    }
+}
+
+impl Default for RankCanonicalizer {
+    fn default() -> Self {
+        Self::new(2)
+    }
+}
+
+impl Canonicalizer for RankCanonicalizer {
+    fn canonicalize(&self, matrix: BitMatrix) -> CanonicalGame {
+        let components: Vec<_> = split_components(&matrix)
+            .into_iter()
+            .map(|component| {
+                let normal = rank_refine_and_order(component.clone(), self.rounds);
+                let transposed = rank_refine_and_order(component.transposed(), self.rounds);
+                min(normal, transposed)
+            })
+            .collect();
+        CanonicalGame::from_components(components)
+    }
+}
+
 /// Compiles the current maze position into its wall-free incidence matrix.
 ///
 /// A vertical wall starts a new matrix row; a horizontal wall starts a new
@@ -381,6 +412,226 @@ fn packed_col(matrix: &BitMatrix, col: usize, rows: &[usize]) -> Vec<u64> {
         }
     }
     result
+}
+
+fn rank_refine_and_order(mut matrix: BitMatrix, rounds: usize) -> BitMatrix {
+    let mut row_keys = initial_row_keys(&matrix);
+    let mut col_keys = initial_col_keys(&matrix);
+
+    for _ in 0..rounds.min(8) {
+        row_keys = rank_refine_rows(&mut matrix, &row_keys, &col_keys);
+        col_keys = rank_refine_cols(&mut matrix, &row_keys, &col_keys);
+        if all_keys_unique(&row_keys) && all_keys_unique(&col_keys) {
+            break;
+        }
+    }
+
+    matrix
+}
+
+fn all_keys_unique(keys: &[u64]) -> bool {
+    if keys.len() < 2 {
+        return true;
+    }
+    let mut sorted = keys.to_vec();
+    sorted.sort_unstable();
+    sorted.windows(2).all(|window| window[0] != window[1])
+}
+
+fn initial_row_keys(matrix: &BitMatrix) -> Vec<u64> {
+    let mut entries: Vec<_> = (0..matrix.rows())
+        .map(|row| RankEntry {
+            previous: 0,
+            score: matrix.row_ones(row).count() as u64,
+            index: row,
+        })
+        .collect();
+    entries.sort_unstable();
+    ranked_keys_by_original_index(entries, matrix.rows())
+}
+
+fn initial_col_keys(matrix: &BitMatrix) -> Vec<u64> {
+    let mut entries: Vec<_> = (0..matrix.cols())
+        .map(|col| RankEntry {
+            previous: 0,
+            score: (0..matrix.rows())
+                .filter(|&row| matrix.get(row, col))
+                .count() as u64,
+            index: col,
+        })
+        .collect();
+    entries.sort_unstable();
+    ranked_keys_by_original_index(entries, matrix.cols())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RankEntry {
+    previous: u64,
+    score: u64,
+    index: usize,
+}
+
+fn rank_refine_rows(matrix: &mut BitMatrix, row_keys: &[u64], col_keys: &[u64]) -> Vec<u64> {
+    let mut entries: Vec<_> = (0..matrix.rows())
+        .map(|row| RankEntry {
+            previous: row_keys[row],
+            score: row_score(matrix, row, col_keys),
+            index: row,
+        })
+        .collect();
+    entries.sort_unstable_by(|left, right| compare_rank_rows(matrix, left, right));
+    let order_and_keys = ranked_order(entries);
+    let rows: Vec<_> = order_and_keys.iter().map(|&(row, _)| row).collect();
+    let cols: Vec<_> = (0..matrix.cols()).collect();
+    *matrix = matrix.reordered(&rows, &cols);
+    order_and_keys.into_iter().map(|(_, key)| key).collect()
+}
+
+fn rank_refine_cols(matrix: &mut BitMatrix, row_keys: &[u64], col_keys: &[u64]) -> Vec<u64> {
+    let mut entries: Vec<_> = (0..matrix.cols())
+        .map(|col| RankEntry {
+            previous: col_keys[col],
+            score: col_score(matrix, col, row_keys),
+            index: col,
+        })
+        .collect();
+    entries.sort_unstable_by(|left, right| compare_rank_cols(matrix, left, right));
+    let order_and_keys = ranked_order(entries);
+    let rows: Vec<_> = (0..matrix.rows()).collect();
+    let cols: Vec<_> = order_and_keys.iter().map(|&(col, _)| col).collect();
+    *matrix = matrix.reordered(&rows, &cols);
+    order_and_keys.into_iter().map(|(_, key)| key).collect()
+}
+
+fn ranked_order(entries: Vec<RankEntry>) -> Vec<(usize, u64)> {
+    let class_count = entries
+        .windows(2)
+        .filter(|window| rank_class_changed(&window[0], &window[1]))
+        .count()
+        + usize::from(!entries.is_empty());
+    let divisor = class_count.saturating_sub(1).max(1);
+    let mut class = 0usize;
+    let mut previous: Option<&RankEntry> = None;
+    entries
+        .iter()
+        .map(|entry| {
+            if previous.is_some_and(|old| rank_class_changed(old, entry)) {
+                class += 1;
+            }
+            previous = Some(entry);
+            let color = if class_count <= 256 {
+                class as u8
+            } else {
+                ((class * 255) / divisor) as u8
+            };
+            (entry.index, (entry.previous << 8) | u64::from(color))
+        })
+        .collect()
+}
+
+fn ranked_keys_by_original_index(entries: Vec<RankEntry>, len: usize) -> Vec<u64> {
+    let mut keys = vec![0; len];
+    for (index, key) in ranked_order(entries) {
+        keys[index] = key;
+    }
+    keys
+}
+
+fn rank_class_changed(left: &RankEntry, right: &RankEntry) -> bool {
+    left.previous != right.previous || left.score != right.score
+}
+
+fn compare_rank_rows(
+    matrix: &BitMatrix,
+    left: &RankEntry,
+    right: &RankEntry,
+) -> std::cmp::Ordering {
+    left.previous
+        .cmp(&right.previous)
+        .then_with(|| left.score.cmp(&right.score))
+        .then_with(|| {
+            matrix
+                .row_words(left.index)
+                .cmp(matrix.row_words(right.index))
+        })
+        .then_with(|| left.index.cmp(&right.index))
+}
+
+fn compare_rank_cols(
+    matrix: &BitMatrix,
+    left: &RankEntry,
+    right: &RankEntry,
+) -> std::cmp::Ordering {
+    left.previous
+        .cmp(&right.previous)
+        .then_with(|| left.score.cmp(&right.score))
+        .then_with(|| compare_cols(matrix, left.index, right.index))
+        .then_with(|| left.index.cmp(&right.index))
+}
+
+fn compare_cols(matrix: &BitMatrix, left: usize, right: usize) -> std::cmp::Ordering {
+    for row_start in (0..matrix.rows()).step_by(64) {
+        let mut left_word = 0u64;
+        let mut right_word = 0u64;
+        for row in row_start..(row_start + 64).min(matrix.rows()) {
+            let bit = row - row_start;
+            if matrix.get(row, left) {
+                left_word |= 1 << bit;
+            }
+            if matrix.get(row, right) {
+                right_word |= 1 << bit;
+            }
+        }
+        match left_word.cmp(&right_word) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn row_score(matrix: &BitMatrix, row: usize, col_keys: &[u64]) -> u64 {
+    let mut degree = 0u64;
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    let mut square_sum = 0u64;
+    for col in matrix.row_ones(row) {
+        degree += 1;
+        let key = mix_rank_key(col_keys[col]);
+        sum = sum.wrapping_add(key);
+        xor ^= key.rotate_left((key & 63) as u32);
+        square_sum = square_sum.wrapping_add(key.wrapping_mul(key | 1));
+    }
+    mix_rank_value(degree ^ sum.rotate_left(7) ^ xor.rotate_left(23) ^ square_sum.rotate_left(41))
+}
+
+fn col_score(matrix: &BitMatrix, col: usize, row_keys: &[u64]) -> u64 {
+    let mut degree = 0u64;
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    let mut square_sum = 0u64;
+    for (row, &row_key) in row_keys.iter().enumerate().take(matrix.rows()) {
+        if matrix.get(row, col) {
+            degree += 1;
+            let key = mix_rank_key(row_key);
+            sum = sum.wrapping_add(key);
+            xor ^= key.rotate_left((key & 63) as u32);
+            square_sum = square_sum.wrapping_add(key.wrapping_mul(key | 1));
+        }
+    }
+    mix_rank_value(degree ^ sum.rotate_left(7) ^ xor.rotate_left(23) ^ square_sum.rotate_left(41))
+}
+
+fn mix_rank_key(history: u64) -> u64 {
+    mix_rank_value(history)
+}
+
+fn mix_rank_value(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]

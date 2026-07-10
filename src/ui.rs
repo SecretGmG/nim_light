@@ -26,7 +26,7 @@ use crate::{
         DfsSolver, Evaluator, EvaluatorConfig, EvaluatorProgress, recommended_cache_shards,
     },
     game::{Game, Move, PlayerKind, SolverMoveResult, solver_move_cancellable},
-    solver::{PseudoCanonicalizer, compile_maze},
+    solver::{RankCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
     symmetry::InvolutionSymmetryFinder,
 };
@@ -490,7 +490,7 @@ const CACHE_FILE: &str = "nim_light.cache";
 fn new_evaluator(threads: usize, cache_shards: usize) -> Arc<DfsSolver> {
     Arc::new(
         Evaluator::with_config(
-            CanonicalMoveGenerator::new(PseudoCanonicalizer),
+            CanonicalMoveGenerator::new(RankCanonicalizer::default()),
             InvolutionSymmetryFinder,
             EvaluatorConfig {
                 threads: Some(threads),

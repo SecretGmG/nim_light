@@ -11,16 +11,35 @@ use nim_light::{
     evaluator::{DfsSolver, Evaluator, EvaluatorConfig, recommended_cache_shards},
     game::{Move, solver_move},
     hybrid_evaluator::HybridEvaluator,
-    solver::{CanonicalGame, PseudoCanonicalizer, compile_maze},
+    solver::{CanonicalGame, Canonicalizer, PseudoCanonicalizer, RankCanonicalizer, compile_maze},
     successor::CanonicalMoveGenerator,
     symmetry::InvolutionSymmetryFinder,
 };
 
 fn shared_cache_suite(c: &mut Criterion) {
-    c.bench_function("shared_cache_suite_8_threads", |bencher| {
+    c.bench_function("shared_cache_suite_8_threads/current", |bencher| {
         bencher.iter(|| {
             let evaluator = Evaluator::with_config(
                 CanonicalMoveGenerator::new(PseudoCanonicalizer),
+                InvolutionSymmetryFinder,
+                EvaluatorConfig {
+                    threads: Some(8),
+                    ..EvaluatorConfig::default()
+                },
+            )
+            .unwrap();
+
+            for game in benchmark_games() {
+                black_box(evaluator.nimber(&game));
+            }
+            black_box(evaluator.stats());
+        });
+    });
+
+    c.bench_function("shared_cache_suite_8_threads/rank", |bencher| {
+        bencher.iter(|| {
+            let evaluator = Evaluator::with_config(
+                CanonicalMoveGenerator::new(RankCanonicalizer::default()),
                 InvolutionSymmetryFinder,
                 EvaluatorConfig {
                     threads: Some(8),
@@ -139,9 +158,15 @@ fn cpu_style_find_zero_move(c: &mut Criterion) {
 
 fn canonicalization_suite(c: &mut Criterion) {
     for (label, game) in canonicalization_benchmark_games() {
-        c.bench_function(&format!("canonicalize/{label}"), |bencher| {
+        c.bench_function(&format!("canonicalize/current/{label}"), |bencher| {
             bencher.iter(|| {
                 black_box(CanonicalGame::from_matrix(black_box(&game)));
+            });
+        });
+
+        c.bench_function(&format!("canonicalize/rank/{label}"), |bencher| {
+            bencher.iter(|| {
+                black_box(RankCanonicalizer::default().canonicalize(black_box(game.clone())));
             });
         });
     }
@@ -153,7 +178,7 @@ fn new_evaluator() -> DfsSolver {
 
 fn new_evaluator_with_threads(threads: usize) -> DfsSolver {
     Evaluator::with_config(
-        CanonicalMoveGenerator::new(PseudoCanonicalizer),
+        CanonicalMoveGenerator::new(RankCanonicalizer::default()),
         InvolutionSymmetryFinder,
         EvaluatorConfig {
             threads: Some(threads),

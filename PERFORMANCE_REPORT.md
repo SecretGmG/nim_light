@@ -698,3 +698,172 @@ mode than the current interactive/editor use. The important support features are
    A `7x7` dense run may be memory-bound before it is CPU-bound. We will need a
    strategy for cache size limits, disk spill, or at least clear reporting when
    the cache is the bottleneck.
+
+## Packed `BitMatrix` storage experiment
+
+Experiment:
+
+- Replaced the existing row-padded `BitMatrix` storage with one dense row-major
+  bitstring: `ceil(rows * cols / 64)` words instead of
+  `rows * ceil(cols / 64)` words.
+- Preserved the existing high-level API by materializing normalized row words
+  on demand.
+- Fixed logical ordering after the first test run showed that comparing raw
+  packed `data` is not equivalent to row-lexicographic matrix comparison.
+
+Result on the shared-cache suite:
+
+```text
+row-padded + direct row clearing:
+  total seconds: 23.083
+  chambers 5x7: 21.151s
+  final cache entries: 93105
+
+packed bitstring:
+  total seconds: 30.074
+  chambers 5x7: 27.640s
+  final cache entries: 93105
+```
+
+Interpretation:
+
+- The packed representation reduced per-matrix payload size for narrow
+  components, but made row-centric operations expensive.
+- Canonicalization, move generation, hashing, row comparison, and transpose
+  traversal all rely heavily on cheap normalized row access.
+- In this direct global replacement, the row-access cost dominated the memory
+  win.
+
+Decision:
+
+- Reverted the global packed storage replacement.
+- Kept the earlier direct row-clearing successor change, which removes the
+  temporary removal-mask allocation and was locally neutral/slightly positive.
+- If memory pressure becomes the bottleneck, the better next experiment is a
+  packed cache-key representation while keeping the working `BitMatrix`
+  row-padded.
+
+## Rank-history canonicalizer experiment
+
+Experiment:
+
+- Added a separate `RankCanonicalizer` with a fixed 8-round schedule.
+- It maintains row and column `u64` history keys. Each round:
+  1. scores rows from their previous row key, current row pattern, and a
+     neighborhood score over current column keys,
+  2. sorts rows by that temporary key,
+  3. appends one ranked `u8` color into the row history key,
+  4. repeats the same operation for columns.
+- The default solver still uses `PseudoCanonicalizer`; this is only an A/B
+  candidate.
+
+Canonicalization-only Criterion results:
+
+```text
+case              current          rank
+dense_5x5        ~8.5-9.6 µs      ~10.6 µs
+dense_7x7        ~15.4 µs         ~15.9 µs
+dense_10x10      ~28.8 µs         ~27.8-32.2 µs
+dense_3x7        ~7.6-9.4 µs      ~11.4-12.9 µs
+spiral_5x5       ~34.8 µs         ~26.2 µs
+spiral_9x9       ~176.5 µs        ~134.8 µs
+chambers_5x7     ~30.7 µs         ~27.5 µs
+chambers_9x11    ~168.6 µs        ~93.2 µs
+```
+
+End-to-end shared-cache result after removing explicit row/column index mixing:
+
+```text
+current, 8 threads, earlier comparable run:
+  dense 5x5:      0.408s, cache 2992
+  dense 3x7:      0.043s, cache 3510
+  spiral 5x5:     1.482s, cache 44050
+  chambers 5x7:  21.151s, cache 93105
+  total:         23.083s, final cache 93105
+
+rank, 8 threads, stopped before chambers:
+  dense 5x5:      0.764s, cache 5688
+  dense 3x7:      0.088s, cache 6617
+  spiral 5x5:     6.673s, cache 113195
+```
+
+An earlier rank variant that mixed the physical row/column index into the score
+was much worse:
+
+```text
+dense 5x5: 11.528s, cache 107150
+```
+
+Interpretation:
+
+- The rank-history approach can be substantially faster per canonicalization on
+  larger maze-like components.
+- Its current ordering quality is too weak. The cache grows enough to dominate
+  the per-call speedup, especially on `spiral_5x5`.
+- Physical row/column indices must not enter the refinement score; doing so
+  makes the result strongly labeling-dependent.
+
+Decision:
+
+- Keep `RankCanonicalizer` isolated as an A/B candidate.
+- Do not switch the default solver.
+- The next useful iteration would need stronger invariant initialization or a
+  tie-breaking policy that improves canonical quality without reintroducing
+  label dependence.
+
+Follow-up optimization:
+
+- Refined both orientations independently, matching the current
+  `PseudoCanonicalizer` orientation policy.
+- Changed the rank color update so exact row/column bit patterns are used only
+  as an ordering tie-break, not stored into the compact color history. The
+  appended `u8` color is based on previous color and compact neighborhood score.
+  This was the key cache-quality fix.
+- Removed per-entry owned row/column pattern buffers. Row tie-breaking now
+  compares `row_words` by reference; column tie-breaking packs temporary words
+  only inside the comparator.
+- Reduced the default rank rounds from 8 to 2. More rounds preserved quality but
+  spent unnecessary time on this benchmark.
+- Added a safe early exit: once both row and column history keys are unique,
+  future rounds cannot reorder anything because the previous key is the primary
+  sort key.
+
+Same-build shared-cache comparison:
+
+```text
+current canonicalizer, 8 threads:
+  dense 5x5:      0.404s, cache 2992
+  dense 3x7:      0.045s, cache 3510
+  spiral 5x5:     1.483s, cache 44050
+  chambers 5x7:  22.101s, cache 93105
+  total:         24.033s, final cache 93105
+
+rank canonicalizer, 2 rounds, 8 threads:
+  dense 5x5:      0.297s, cache 2976
+  dense 3x7:      0.031s, cache 3494
+  spiral 5x5:     0.928s, cache 44103
+  chambers 5x7:  13.854s, cache 93758
+  total:         15.110s, final cache 93758
+```
+
+Interpretation:
+
+- Cache quality is within target: `93758 / 93105 = 1.0070`, about +0.7%.
+- Runtime improved by about 37% on the local shared-cache suite.
+- Two rounds appear to be the best tested tradeoff. Three and four rounds kept
+  cache quality but were slower:
+
+```text
+rank 4 rounds: total 19.720s, final cache 93139
+rank 3 rounds: total 17.744s, final cache 93140
+rank 2 rounds: total 15.110s, final cache 93758
+```
+
+Current decision:
+
+- `RankCanonicalizer` is now wired as the default `DfsSolver` canonicalizer for
+  the UI/gameplay/normal solver path.
+- `PseudoCanonicalizer` remains available for explicit A/B benchmarks and
+  comparison tests.
+- Retest on the large machine and on the dense `7x7` workload, because the
+  slightly larger cache may affect memory pressure differently there.
